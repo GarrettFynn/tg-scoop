@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tg-scoop"
+version = "0.1.0"
+description = "从 Telegram Desktop 本地缓存中提取受限保存的视频与图片（CLI + 简洁 GUI 双入口）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "pycryptodome>=3.19",
+    "customtkinter>=5.2",
+]
+
+[project.optional-dependencies]
+# v0.2 MTProto 集成（DEVELOPMENT.md §5）
+mtproto = ["telethon>=1.34"]
+dev = ["pytest>=8.0", "ruff==0.16.3", "tgcrypto>=1.2"]  # ruff 精确锁定，见 requirements.txt；tgcrypto 仅 golden 生成器需要
+
+[project.scripts]
+tg-scoop = "tg_scoop.cli:main"
+tg-scoop-gui = "tg_scoop.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+src = ["src", "tests"]

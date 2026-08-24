@@ -1,0 +1,9 @@
+# 运行时依赖
+pycryptodome>=3.19        # AES-ECB 原语（组合实现 IGE）与 CTR 模式
+customtkinter>=5.2        # 简洁 GUI（DEVELOPMENT.md §11）
+# telethon 为 v0.2 MTProto 可选依赖（pyproject 的 mtproto extra）：pip install .[mtproto]
+
+# 开发依赖（可移入 requirements-dev.txt）
+pytest>=8.0
+ruff==0.16.3  # 门禁工具精确锁定：规则集随版本漂移，升级需主脑指令
+tgcrypto>=1.2  # 仅 scripts/generate_golden.py 重新生成 golden 向量需要；pytest 不依赖

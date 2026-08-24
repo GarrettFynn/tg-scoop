@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.DS_Store
+Thumbs.db
+.pytest_cache/
+.ruff_cache/
+# 第三方参考实现（各自带 .git 的独立 clone，不作为子模块提交）
+refs/
