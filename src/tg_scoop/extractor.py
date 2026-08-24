@@ -9,6 +9,7 @@
 
 import hashlib
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -181,7 +182,13 @@ class Extractor:
         self.skipped_entries: list[SkippedEntry] = []
         self.failed_entries: list[FailedEntry] = []
 
-    def extract_all(self, cache_dir: Path, out_dir: Path) -> ExtractionStats:
+    def extract_all(
+        self,
+        cache_dir: Path,
+        out_dir: Path,
+        file_cb: "Callable[[], None] | None" = None,
+        cancel_event: object | None = None,
+    ) -> ExtractionStats:
         """对 cache 目录执行完整提取流程。
 
         逐文件容错：单个解密失败计入 failed 并继续；无法识别计入
@@ -191,9 +198,14 @@ class Extractor:
         Args:
             cache_dir: tdata/user_data/cache 目录。
             out_dir: 输出目录（不存在则创建）。
+            file_cb: 可选进度回调，每处理完一个文件恰好调用一次
+                （无论该文件落入哪个分支），供 GUI 进度条计数。
+            cancel_event: 可选协作式取消事件（threading.Event 风格鸭子
+                类型）；每个文件处理前检查 is_set()，置位即跳过本轮
+                剩余文件并返回部分统计——不杀线程、不中断当前文件。
 
         Returns:
-            提取统计。
+            提取统计；取消时为已处理部分的部分统计。
 
         Raises:
             CacheNotFoundError: 缓存目录不存在或为空。
@@ -205,63 +217,77 @@ class Extractor:
         source_name = Path(cache_dir).name  # manifest 来源目录字段："cache" / "media_cache"
 
         for path in iter_cache_files(cache_dir):
-            try:
-                data = self._decryptor.decrypt_file(path)
-            except DecryptionError as exc:
-                stats.failed += 1
-                reason = type(exc).__name__
-                stats.failed_reasons[reason] = stats.failed_reasons.get(reason, 0) + 1
-                self.failed_entries.append(
-                    FailedEntry(path.name, source_name, reason)
-                )
-                continue
-
-            media_type = self._detector.sniff(data[:SNIFF_LEN])
-            if media_type is None:
-                stats.skipped += 1
-                self.skipped_entries.append(
-                    SkippedEntry(path.name, source_name, "unrecognized_media_type")
-                )
-                continue
-
-            digest = hashlib.sha256(data).digest()
-            if self._is_duplicate(digest):
-                stats.duplicates += 1
-                self.skipped_entries.append(
-                    SkippedEntry(path.name, source_name, "duplicate")
-                )
-                continue
-
-            # §6.1 要求本地时区朴素时间：naive datetime 是有意选择，不加 tz
-            mtime = datetime.fromtimestamp(path.stat().st_mtime)  # noqa: DTZ006
-            name = build_fallback_name(mtime, digest, media_type)
-
-            # 幂等关键：确定性命名下，目标已存在且内容相同 -> 计重复跳过；
-            # 内容不同（同名不同物）则由 save_media 的 unique_path 加序号
-            target = out_dir / name
-            if target.exists() and self._file_digest(target) == digest:
-                self._seen.add(digest)
-                stats.duplicates += 1
-                self.skipped_entries.append(
-                    SkippedEntry(path.name, source_name, "duplicate")
-                )
-                continue
-
-            save_media(data, out_dir, name, mtime)  # OSError 上抛
-            self._seen.add(digest)
-            stats.succeeded += 1
-            self.extracted_entries.append(
-                ExtractedEntry(
-                    file_name=name,
-                    sha256=digest.hex(),
-                    size=len(data),
-                    mtime=mtime.isoformat(timespec="seconds"),
-                    media_type=media_type.value,
-                    source_cache_dir=source_name,
-                )
-            )
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            self._process_one(path, source_name, out_dir, stats)
+            if file_cb is not None:
+                file_cb()
 
         return stats
+
+    def _process_one(
+        self,
+        path: Path,
+        source_name: str,
+        out_dir: Path,
+        stats: ExtractionStats,
+    ) -> None:
+        """处理单个缓存文件（extract_all 的循环体，分支逻辑见 §6/§7）。"""
+        try:
+            data = self._decryptor.decrypt_file(path)
+        except DecryptionError as exc:
+            stats.failed += 1
+            reason = type(exc).__name__
+            stats.failed_reasons[reason] = stats.failed_reasons.get(reason, 0) + 1
+            self.failed_entries.append(
+                FailedEntry(path.name, source_name, reason)
+            )
+            return
+
+        media_type = self._detector.sniff(data[:SNIFF_LEN])
+        if media_type is None:
+            stats.skipped += 1
+            self.skipped_entries.append(
+                SkippedEntry(path.name, source_name, "unrecognized_media_type")
+            )
+            return
+
+        digest = hashlib.sha256(data).digest()
+        if self._is_duplicate(digest):
+            stats.duplicates += 1
+            self.skipped_entries.append(
+                SkippedEntry(path.name, source_name, "duplicate")
+            )
+            return
+
+        # §6.1 要求本地时区朴素时间：naive datetime 是有意选择，不加 tz
+        mtime = datetime.fromtimestamp(path.stat().st_mtime)  # noqa: DTZ006
+        name = build_fallback_name(mtime, digest, media_type)
+
+        # 幂等关键：确定性命名下，目标已存在且内容相同 -> 计重复跳过；
+        # 内容不同（同名不同物）则由 save_media 的 unique_path 加序号
+        target = out_dir / name
+        if target.exists() and self._file_digest(target) == digest:
+            self._seen.add(digest)
+            stats.duplicates += 1
+            self.skipped_entries.append(
+                SkippedEntry(path.name, source_name, "duplicate")
+            )
+            return
+
+        save_media(data, out_dir, name, mtime)  # OSError 上抛
+        self._seen.add(digest)
+        stats.succeeded += 1
+        self.extracted_entries.append(
+            ExtractedEntry(
+                file_name=name,
+                sha256=digest.hex(),
+                size=len(data),
+                mtime=mtime.isoformat(timespec="seconds"),
+                media_type=media_type.value,
+                source_cache_dir=source_name,
+            )
+        )
 
     def _is_duplicate(self, digest: bytes) -> bool:
         """查询本次运行内是否已落盘过相同内容（SHA-256 查重）。

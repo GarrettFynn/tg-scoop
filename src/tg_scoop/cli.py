@@ -13,7 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from tg_scoop import process_check
-from tg_scoop.cache_decryptor import CacheDecryptor
+from tg_scoop.cache_decryptor import CacheDecryptor, iter_cache_files
 from tg_scoop.exceptions import (
     CacheNotFoundError,
     DecryptionError,
@@ -67,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--password",
         default=None,
-        help="tdata 本地密码（未设密码可省略；不设密码的 tdata 无需提供）",
+        help="Telegram 锁定密码（设置→隐私与安全→锁定密码）；未设置可省略。注意：会留在 shell 历史，共享机器建议省略改用交互式输入",
     )
     parser.add_argument(
         "--chat-id",
@@ -82,6 +82,8 @@ def run_pipeline(
     output_dir: Path,
     password: str | None,
     progress_cb: Callable[[str], None] | None = None,
+    file_progress_cb: Callable[[int, int], None] | None = None,
+    cancel_event: object | None = None,
 ) -> ExtractionStats:
     """共享提取管道：定位 tdata -> 派生 LocalKey -> 双缓存目录提取。
 
@@ -96,9 +98,14 @@ def run_pipeline(
         output_dir: 输出目录。
         password: tdata 本地密码；None/空串表示无密码。
         progress_cb: 日志行回调（CLI 传 print，GUI 传 Queue.put）。
+        file_progress_cb: 可选逐文件进度回调，参数为
+            ``(已完成数, 总文件数)``，每个文件处理完恰好一次（GUI 进度条用）。
+        cancel_event: 可选协作式取消事件（threading.Event 风格鸭子
+            类型）；置位后本轮剩余文件跳过，manifest 与统计照常落盘
+            （记录实际完成部分），并输出一行取消日志。
 
     Returns:
-        合并后的提取统计。
+        合并后的提取统计；取消时为部分统计。
 
     Raises:
         TDataNotFoundError: tdata 目录或 key 文件不存在。
@@ -135,12 +142,34 @@ def run_pipeline(
     # 共享一个 Extractor 实例：跨目录内容去重因此生效
     extractor = Extractor(CacheDecryptor(local_key))
     total = ExtractionStats()
+    # 预数总文件数（空缓存目录与提取循环同语义：跳过不计）
+    total_files = 0
+    for d in cache_dirs:
+        try:
+            total_files += sum(1 for _ in iter_cache_files(d))
+        except CacheNotFoundError:
+            pass
+    done = 0
+
+    def _file_cb() -> None:
+        nonlocal done
+        done += 1
+        if file_progress_cb is not None:
+            file_progress_cb(done, total_files)
+
     for cache_dir in cache_dirs:
         try:
             log(f"处理缓存目录：{cache_dir}")
-            total.merge(extractor.extract_all(cache_dir, output_dir))
+            total.merge(
+                extractor.extract_all(
+                    cache_dir, output_dir,
+                    file_cb=_file_cb, cancel_event=cancel_event,
+                )
+            )
         except CacheNotFoundError as exc:
             log(f"跳过：{exc}")
+    if cancel_event is not None and cancel_event.is_set():
+        log("已按用户要求取消：本轮剩余文件已跳过（部分完成）")
     manifest_path = write_manifest(
         output_dir,
         tdata_path=tdata_path,
