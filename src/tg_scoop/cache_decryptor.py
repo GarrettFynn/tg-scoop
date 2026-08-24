@@ -129,6 +129,17 @@ def derive_storage_key_iv(local_key: bytes, salt: bytes) -> tuple[bytes, bytes]:
     return key, iv
 
 
+def _verify_check_block(check: bytes, local_key: bytes, salt: bytes) -> None:
+    """校验 TDEF 校验块（16B 随机头 + 32B checksum），失败抛 DecryptionError。
+
+    decrypt_storage_file 与 CacheDecryptor.decrypt_file_iter 共用的
+    同一份校验逻辑（DEVELOPMENT.md §3.5）。
+    """
+    header, checksum = check[:16], check[16:48]
+    if hashlib.sha256(local_key + salt + header).digest() != checksum:
+        raise DecryptionError("wrong key for storage file")
+
+
 def decrypt_storage_file(raw: bytes, local_key: bytes) -> bytes:
     """解密一个完整的 TDEF 缓存文件（含 magic 与密钥校验）。
 
@@ -157,9 +168,7 @@ def decrypt_storage_file(raw: bytes, local_key: bytes) -> bytes:
 
     # 校验块：16B 随机头 + 32B checksum（与媒体数据同一条 CTR 流）
     check = d.decrypt(raw[TDEF_CHECK_OFFSET:TDEF_DATA_OFFSET])
-    header, checksum = check[:16], check[16:48]
-    if hashlib.sha256(local_key + salt + header).digest() != checksum:
-        raise DecryptionError("wrong key for storage file")
+    _verify_check_block(check, local_key, salt)
 
     # 媒体数据：计数器接着校验块（块 3）继续，不能重置
     return d.decrypt(raw[TDEF_DATA_OFFSET:])
@@ -235,6 +244,52 @@ class CacheDecryptor:
         path = Path(path)
         try:
             return decrypt_storage_file(path.read_bytes(), self._local_key)
+        except DecryptionError as exc:
+            raise DecryptionError(f"{path}: {exc}") from exc
+
+    def decrypt_file_iter(
+        self, path: Path, chunk_size: int = 1 << 20
+    ) -> Iterator[bytes]:
+        """流式解密 TDEF 文件，逐块产出明文（内存峰值 ≈ chunk_size）。
+
+        校验块与媒体数据共用一条 CTR 流（§3.5 关键约束与既有实现一致）；
+        chunk_size 必须是 16 的倍数（默认 1 MiB）。生成器是惰性的：
+        首次 next() 才读取头部并完成密钥校验。
+
+        Args:
+            path: 缓存文件路径。
+            chunk_size: 每块字节数，必须是 16 的倍数。
+
+        Yields:
+            明文分块（末块可能不足 chunk_size）。
+
+        Raises:
+            DecryptionError: chunk_size 非 16 倍数、非 TDEF、密钥校验
+                失败或数据损坏；异常信息附带文件路径，与 decrypt_file
+                同口径。调用方应逐文件 try/except 并继续。
+        """
+        path = Path(path)
+        try:
+            if chunk_size % _BLOCK != 0:
+                raise DecryptionError(
+                    f"chunk_size must be a multiple of 16: {chunk_size}"
+                )
+            with open(path, "rb") as f:
+                head = f.read(TDEF_DATA_OFFSET)
+                if len(head) < TDEF_DATA_OFFSET:
+                    raise DecryptionError(
+                        f"file too short to be TDEF: {len(head)} bytes"
+                    )
+                if head[:4] != TDEF_MAGIC:
+                    raise DecryptionError("wrong magic, not a TDEF file")
+                salt = head[TDEF_SALT_OFFSET:TDEF_CHECK_OFFSET]
+                key, iv = derive_storage_key_iv(self._local_key, salt)
+                d = CtrDecryptor(key, iv)
+                check = d.decrypt(head[TDEF_CHECK_OFFSET:TDEF_DATA_OFFSET])
+                _verify_check_block(check, self._local_key, salt)
+                # 媒体数据：计数器接着校验块（块 3）继续，逐块产出
+                while chunk := f.read(chunk_size):
+                    yield d.decrypt(chunk)
         except DecryptionError as exc:
             raise DecryptionError(f"{path}: {exc}") from exc
 

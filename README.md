@@ -62,7 +62,17 @@ tg-scoop --password "your-passcode"
 | `--tdata-path` | tdata 目录；缺省按平台自动探测（Windows: `%APPDATA%/Telegram Desktop/tdata`） |
 | `--output-dir` | 输出目录；缺省 `./tg-scoop-output` |
 | `--password` | tdata 本地密码；未提供且需要时会交互询问 |
+| `--jobs` | 并行解密进程数；缺省 `1`（串行，保守）；推荐档位见下表 |
+| `--analyze` | 只读分析缓存占用（Top/最旧各 20 + 清理建议），不提取、不写盘 |
 | `--chat-id` | 【v0.2 预留】按聊天过滤；当前版本忽略并给出警告 |
+
+性能档位（GUI 下拉同义；并行输出与串行逐字节一致，只影响速度）：
+
+| 档位 | 含义 |
+|---|---|
+| 保守 | `--jobs 1` 串行，内存占用最低 |
+| 均衡（推荐） | `--jobs N`，N = min(核数-1, 8)（RAM < 4GB 时收敛到 2），GUI 缺省 |
+| 极速 | `--jobs` = CPU 核数，适合大缓存且内存充裕的机器 |
 
 **使用前提**：先在 Telegram Desktop 中完整播放/查看目标媒体（确保写入本地缓存），然后**完全退出** Telegram Desktop 再运行本工具。
 

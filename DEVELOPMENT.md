@@ -653,6 +653,19 @@ def decrypt_storage_file(raw: bytes, local_key: bytes) -> bytes:
 强制了这一点。CTR 计数器按 OpenSSL 惯例**大端递增**，每 16 字节
 块 +1（`block_index += len(chunk) // 16`）。
 
+流式解密（N-5，v0.1.3 落地）：`decrypt_file_iter` 分块解密（默认
+1 MiB），校验块与媒体数据仍共用一条 CTR 流；Extractor 管线为
+"首块嗅探→临时文件+流式哈希→查重→改名"，内存峰值与文件大小脱钩；
+输出与旧全量路径逐字节一致。
+
+并行解密（C-02，v0.1.3 落地）：`--jobs N > 1` 时
+`multiprocessing.Pool` worker 各自持有 LocalKey（仅进程内存，不落盘）
+只做解密并写池内临时文件（`输出目录/.tg-scoop-pool/<pid>/`），主进程
+按 `iter_cache_files` 排序序经 `imap` 保序消费（sniff/哈希/查重/改名
+与串行同一管线）——输出与串行逐字节一致是确定性红线。临时文件清理
+契约：`.tg-scoop-partial-*` 与 `.tg-scoop-pool/` 均在运行开始与结束
+整体清理；取消置位停止领取新结果，统计为已消费部分。
+
 ### 3.6 密码场景的处理
 
 - 未设本地密码：`passcode = b""`，PBKDF2 仅 1 轮——`key_datas` 的

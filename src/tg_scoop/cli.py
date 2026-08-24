@@ -8,12 +8,19 @@
 
 import argparse
 import getpass
+import multiprocessing
+import shutil
 import sys
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from tg_scoop import process_check
-from tg_scoop.cache_decryptor import CacheDecryptor, iter_cache_files
+from tg_scoop.cache_decryptor import (
+    SKIP_FILENAMES,
+    CacheDecryptor,
+    iter_cache_files,
+)
 from tg_scoop.exceptions import (
     CacheNotFoundError,
     DecryptionError,
@@ -21,7 +28,12 @@ from tg_scoop.exceptions import (
     TDataNotFoundError,
     TgScoopError,
 )
-from tg_scoop.extractor import ExtractionStats, Extractor
+from tg_scoop.extractor import (
+    ExtractionStats,
+    Extractor,
+    _pool_decrypt_one,
+    _pool_worker_init,
+)
 from tg_scoop.manifest import write_manifest
 from tg_scoop.tdata_reader import TdataReader
 
@@ -74,6 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="【v0.2 预留】只处理指定聊天的媒体；当前版本忽略",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="并行解密进程数；1=串行（保守）；auto 见 GUI/文档推荐档位",
+    )
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="只读分析缓存占用（Top/最旧各 20），不提取；与提取互斥",
+    )
     return parser
 
 
@@ -84,6 +107,7 @@ def run_pipeline(
     progress_cb: Callable[[str], None] | None = None,
     file_progress_cb: Callable[[int, int], None] | None = None,
     cancel_event: object | None = None,
+    jobs: int = 1,
 ) -> ExtractionStats:
     """共享提取管道：定位 tdata -> 派生 LocalKey -> 双缓存目录提取。
 
@@ -103,6 +127,9 @@ def run_pipeline(
         cancel_event: 可选协作式取消事件（threading.Event 风格鸭子
             类型）；置位后本轮剩余文件跳过，manifest 与统计照常落盘
             （记录实际完成部分），并输出一行取消日志。
+        jobs: 并行解密进程数（C-02）；1=串行（默认，行为与旧版一致）。
+            >1 时 worker 进程只解密写池内临时文件，主进程按排序序
+            保序消费——输出与串行逐字节一致（确定性红线）。
 
     Returns:
         合并后的提取统计；取消时为部分统计。
@@ -157,17 +184,23 @@ def run_pipeline(
         if file_progress_cb is not None:
             file_progress_cb(done, total_files)
 
-    for cache_dir in cache_dirs:
-        try:
-            log(f"处理缓存目录：{cache_dir}")
-            total.merge(
-                extractor.extract_all(
-                    cache_dir, output_dir,
-                    file_cb=_file_cb, cancel_event=cancel_event,
+    if jobs > 1:
+        _run_pipeline_parallel(
+            extractor, cache_dirs, output_dir, local_key, total,
+            jobs, _file_cb, cancel_event, log,
+        )
+    else:
+        for cache_dir in cache_dirs:
+            try:
+                log(f"处理缓存目录：{cache_dir}")
+                total.merge(
+                    extractor.extract_all(
+                        cache_dir, output_dir,
+                        file_cb=_file_cb, cancel_event=cancel_event,
+                    )
                 )
-            )
-        except CacheNotFoundError as exc:
-            log(f"跳过：{exc}")
+            except CacheNotFoundError as exc:
+                log(f"跳过：{exc}")
     if cancel_event is not None and cancel_event.is_set():
         log("已按用户要求取消：本轮剩余文件已跳过（部分完成）")
     manifest_path = write_manifest(
@@ -180,6 +213,101 @@ def run_pipeline(
     )
     log(f"manifest 已写入：{manifest_path}")
     return total
+
+
+def _run_pipeline_parallel(
+    extractor: Extractor,
+    cache_dirs: list[Path],
+    output_dir: Path,
+    local_key: bytes,
+    total: ExtractionStats,
+    jobs: int,
+    file_cb: Callable[[], None],
+    cancel_event: object | None,
+    log: Callable[[str], None],
+) -> None:
+    """并行提取路径（C-02，run_pipeline 的 jobs>1 分支）。
+
+    worker 进程只解密写池内临时文件（``输出目录/.tg-scoop-pool/<pid>/``），
+    主进程按 ``iter_cache_files`` 排序序经 ``imap`` 保序消费——命名/去重/
+    manifest 与串行逐字节一致（确定性红线）。池目录开始与结束整体清理。
+    取消置位时停止领取新结果，统计为已消费部分。
+    """
+    pool_root = Path(output_dir) / ".tg-scoop-pool"
+    shutil.rmtree(pool_root, ignore_errors=True)  # 清理上次残留
+    with multiprocessing.Pool(
+        jobs, initializer=_pool_worker_init, initargs=(local_key, str(pool_root))
+    ) as pool:
+        for cache_dir in cache_dirs:
+            try:
+                log(f"处理缓存目录：{cache_dir}")
+                files = list(iter_cache_files(cache_dir))
+            except CacheNotFoundError as exc:
+                log(f"跳过：{exc}")
+                continue
+            for path_str, plain, err in pool.imap(
+                _pool_decrypt_one, (str(p) for p in files)
+            ):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                extractor.consume_predecrypted(
+                    Path(path_str), cache_dir.name,
+                    Path(output_dir), total, plain, err,
+                )
+                file_cb()
+    shutil.rmtree(pool_root, ignore_errors=True)
+
+
+def analyze_cache(tdata_path: Path | None, log: Callable[[str], None] = print) -> None:
+    """只读缓存占用分析（C-11）：不解密、不写 tdata、不写输出目录。
+
+    输出：缓存总大小/文件数、占空间 Top 20（大小降序）、最旧 20 个
+    （mtime 升序），末尾固定引导文案。
+
+    Raises:
+        TDataNotFoundError: tdata 目录不存在。
+        CacheNotFoundError: 两个候选缓存目录都不存在。
+    """
+    tdata_path = (
+        Path(tdata_path) if tdata_path else TdataReader.default_tdata_path()
+    )
+    user_data = tdata_path / "user_data"
+    cache_dirs = [
+        d for d in (user_data / name for name in CACHE_DIR_NAMES) if d.is_dir()
+    ]
+    if not cache_dirs:
+        raise CacheNotFoundError(
+            f"未找到缓存目录（{user_data} 下无 {'/'.join(CACHE_DIR_NAMES)}）"
+        )
+
+    entries: list[tuple[int, float, Path]] = []  # (size, mtime, path)
+    for cache_dir in cache_dirs:
+        for p in cache_dir.rglob("*"):
+            if p.is_file() and p.name not in SKIP_FILENAMES:
+                st = p.stat()
+                entries.append((st.st_size, st.st_mtime, p))
+
+    total_size = sum(e[0] for e in entries)
+    log(f"tdata 目录：{tdata_path}")
+    log(f"缓存总大小：{total_size} 字节（{total_size / (1 << 20):.1f} MiB），"
+        f"文件数：{len(entries)}")
+
+    def _fmt(entry: tuple[int, float, Path]) -> str:
+        size, mtime, p = entry
+        ts = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")  # noqa: DTZ006 —— 与 manifest mtime 同口径（本地朴素时间）
+        return f"  {size:>12} 字节  {ts}  {p}"
+
+    log("占空间 Top 20：")
+    for entry in sorted(entries, key=lambda e: (-e[0], e[1]))[:20]:
+        log(_fmt(entry))
+    log("最旧 20 个：")
+    for entry in sorted(entries, key=lambda e: (e[1], -e[0]))[:20]:
+        log(_fmt(entry))
+    log(
+        "清理建议：以上清单仅供人工核对。请优先使用 Telegram 自带功能"
+        "（设置 → 高级 → 管理本地存储）清理旧缓存；"
+        "tg-scoop 不删除任何 tdata 内文件。"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -199,10 +327,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.chat_id is not None:
         print("警告：--chat-id 是 v0.2 预留参数，当前版本忽略", file=sys.stderr)
 
+    if args.analyze:
+        # 只读分析模式（C-11）：不解密、不写任何目录
+        try:
+            analyze_cache(args.tdata_path)
+        except (TDataNotFoundError, CacheNotFoundError) as exc:
+            print(f"错误：{exc}", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        return EXIT_OK
+
     try:
         try:
             total = run_pipeline(
-                args.tdata_path, args.output_dir, args.password, progress_cb=print
+                args.tdata_path, args.output_dir, args.password,
+                progress_cb=print, jobs=args.jobs,
             )
         except PasswordRequiredError:
             # 未提供密码但 tdata 设有本地密码：交互询问一次后重试
@@ -210,7 +348,8 @@ def main(argv: list[str] | None = None) -> int:
             if not entered:
                 raise PasswordRequiredError("passcode input cancelled")
             total = run_pipeline(
-                args.tdata_path, args.output_dir, entered, progress_cb=print
+                args.tdata_path, args.output_dir, entered,
+                progress_cb=print, jobs=args.jobs,
             )
     except (PasswordRequiredError, DecryptionError) as exc:
         print(f"错误：密钥派生失败（{exc}）", file=sys.stderr)

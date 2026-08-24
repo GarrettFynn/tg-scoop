@@ -8,6 +8,7 @@
 """
 
 import hashlib
+import itertools
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -29,6 +30,9 @@ FILENAME_MAX_LEN = 200
 # Windows 非法字符（§6.1 净化规则）；控制字符另行按 ord < 32 过滤
 ILLEGAL_FILENAME_CHARS = '<>:"/\\|?*'
 _ILLEGAL_SET = frozenset(ILLEGAL_FILENAME_CHARS)
+
+_partial_seq = itertools.count()
+"""流式管线临时文件序号（.tg-scoop-partial-{pid}-{序号}）。"""
 
 
 @dataclass
@@ -215,6 +219,9 @@ class Extractor:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         source_name = Path(cache_dir).name  # manifest 来源目录字段："cache" / "media_cache"
+        # 清理上次中断残留的临时文件（流式管线清理契约）
+        for leftover in out_dir.glob(".tg-scoop-partial-*"):
+            leftover.unlink(missing_ok=True)
 
         for path in iter_cache_files(cache_dir):
             if cancel_event is not None and cancel_event.is_set():
@@ -232,10 +239,40 @@ class Extractor:
         out_dir: Path,
         stats: ExtractionStats,
     ) -> None:
-        """处理单个缓存文件（extract_all 的循环体，分支逻辑见 §6/§7）。"""
+        """流式处理单个缓存文件（N-5）：首块嗅探 -> 临时文件+流式哈希 -> 查重改名。
+
+        对外契约（stats 四计数、manifest 字段与口径、文件名、幂等、
+        失败/跳过原因）与旧全量路径逐字节一致；内存峰值与文件大小脱钩。
+        """
+        tmp_path: Path | None = None
         try:
-            data = self._decryptor.decrypt_file(path)
+            stream = self._decryptor.decrypt_file_iter(path)
+            first = next(stream, b"")  # 空数据边界：TDEF 无媒体数据
+            media_type = self._detector.sniff(first[:SNIFF_LEN])
+            if media_type is None:
+                # 早停：不读取该文件余量
+                stats.skipped += 1
+                self.skipped_entries.append(
+                    SkippedEntry(path.name, source_name, "unrecognized_media_type")
+                )
+                return
+            # 识别为媒体：解密 -> 哈希 -> 写临时文件一趟完成
+            hasher = hashlib.sha256()
+            size = 0
+            tmp_path = (
+                out_dir / f".tg-scoop-partial-{os.getpid()}-{next(_partial_seq)}"
+            )
+            with open(tmp_path, "wb") as f:
+                chunk = first
+                while chunk:
+                    hasher.update(chunk)
+                    f.write(chunk)
+                    size += len(chunk)
+                    chunk = next(stream, b"")
+            digest = hasher.digest()
         except DecryptionError as exc:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
             stats.failed += 1
             reason = type(exc).__name__
             stats.failed_reasons[reason] = stats.failed_reasons.get(reason, 0) + 1
@@ -244,16 +281,24 @@ class Extractor:
             )
             return
 
-        media_type = self._detector.sniff(data[:SNIFF_LEN])
-        if media_type is None:
-            stats.skipped += 1
-            self.skipped_entries.append(
-                SkippedEntry(path.name, source_name, "unrecognized_media_type")
-            )
-            return
+        self._finalize(
+            path, source_name, out_dir, stats, tmp_path, digest, size, media_type
+        )
 
-        digest = hashlib.sha256(data).digest()
+    def _finalize(
+        self,
+        path: Path,
+        source_name: str,
+        out_dir: Path,
+        stats: ExtractionStats,
+        tmp_path: Path,
+        digest: bytes,
+        size: int,
+        media_type: MediaType,
+    ) -> None:
+        """查重、命名、改名落盘与计数记录（串行管线与并行消费共用）。"""
         if self._is_duplicate(digest):
+            tmp_path.unlink(missing_ok=True)
             stats.duplicates += 1
             self.skipped_entries.append(
                 SkippedEntry(path.name, source_name, "duplicate")
@@ -265,9 +310,10 @@ class Extractor:
         name = build_fallback_name(mtime, digest, media_type)
 
         # 幂等关键：确定性命名下，目标已存在且内容相同 -> 计重复跳过；
-        # 内容不同（同名不同物）则由 save_media 的 unique_path 加序号
+        # 内容不同（同名不同物）则由 unique_path 加序号（原 save_media 语义）
         target = out_dir / name
         if target.exists() and self._file_digest(target) == digest:
+            tmp_path.unlink(missing_ok=True)
             self._seen.add(digest)
             stats.duplicates += 1
             self.skipped_entries.append(
@@ -275,14 +321,17 @@ class Extractor:
             )
             return
 
-        save_media(data, out_dir, name, mtime)  # OSError 上抛
+        final_path = unique_path(out_dir, name)
+        os.replace(tmp_path, final_path)  # OSError 上抛
+        ts = mtime.timestamp()
+        os.utime(final_path, (ts, ts))
         self._seen.add(digest)
         stats.succeeded += 1
         self.extracted_entries.append(
             ExtractedEntry(
-                file_name=name,
+                file_name=final_path.name,
                 sha256=digest.hex(),
-                size=len(data),
+                size=size,
                 mtime=mtime.isoformat(timespec="seconds"),
                 media_type=media_type.value,
                 source_cache_dir=source_name,
@@ -304,3 +353,92 @@ class Extractor:
     def _file_digest(path: Path) -> bytes:
         """计算已有输出文件的 SHA-256（用于幂等判定）。"""
         return hashlib.sha256(Path(path).read_bytes()).digest()
+
+    def consume_predecrypted(
+        self,
+        path: Path,
+        source_name: str,
+        out_dir: Path,
+        stats: ExtractionStats,
+        plain_path: str | None,
+        error_reason: str | None,
+    ) -> None:
+        """消费并行 worker 的预解密产物（C-02），与 _process_one 同口径。
+
+        池内明文文件即临时文件：sniff/流式哈希后直接交 _finalize
+        查重改名（不二次写盘）；未识别/失败分支负责删除池文件。
+
+        Args:
+            path: 原始缓存文件路径（命名/mtime/记录来源）。
+            source_name: 来源缓存目录名。
+            out_dir: 输出目录。
+            stats: 累计统计（并行路径直接消费进合并统计）。
+            plain_path: 池内明文临时文件路径；None 表示解密失败。
+            error_reason: 解密失败的异常类型名；None 表示成功。
+        """
+        if error_reason is not None:
+            stats.failed += 1
+            stats.failed_reasons[error_reason] = (
+                stats.failed_reasons.get(error_reason, 0) + 1
+            )
+            self.failed_entries.append(
+                FailedEntry(path.name, source_name, error_reason)
+            )
+            return
+        assert plain_path is not None  # 与 error_reason 互斥（worker 契约）
+        tmp_path = Path(plain_path)
+        with open(tmp_path, "rb") as f:
+            first = f.read(SNIFF_LEN)
+        media_type = self._detector.sniff(first)
+        if media_type is None:
+            tmp_path.unlink(missing_ok=True)
+            stats.skipped += 1
+            self.skipped_entries.append(
+                SkippedEntry(path.name, source_name, "unrecognized_media_type")
+            )
+            return
+        hasher = hashlib.sha256()
+        size = 0
+        with open(tmp_path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                hasher.update(chunk)
+                size += len(chunk)
+        self._finalize(
+            path, source_name, out_dir, stats,
+            tmp_path, hasher.digest(), size, media_type,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 并行 worker（C-02）：multiprocessing.Pool 的 initializer 与任务函数。
+# 必须是模块级函数（Windows spawn 依赖按限定名 pickle）。worker 只解密
+# 并写池内临时文件，不写最终输出、不共享状态；LocalKey 仅进程内存持有。
+# ---------------------------------------------------------------------------
+
+_POOL_DECRYPTOR: CacheDecryptor | None = None
+_POOL_DIR: Path | None = None
+
+
+def _pool_worker_init(local_key: bytes, pool_root: str) -> None:
+    """Pool worker 初始化：各自持有 LocalKey 构造解密器并建私有子目录。"""
+    global _POOL_DECRYPTOR, _POOL_DIR
+    _POOL_DECRYPTOR = CacheDecryptor(local_key)
+    _POOL_DIR = Path(pool_root) / str(os.getpid())
+    _POOL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _pool_decrypt_one(path_str: str) -> tuple[str, str | None, str | None]:
+    """worker 任务：解密一个缓存文件并写池内临时文件。
+
+    Returns:
+        ``(缓存路径, 池内明文临时路径 或 None, 异常类型名 或 None)``。
+    """
+    path = Path(path_str)
+    assert _POOL_DECRYPTOR is not None and _POOL_DIR is not None
+    try:
+        data = _POOL_DECRYPTOR.decrypt_file(path)
+    except DecryptionError as exc:
+        return path_str, None, type(exc).__name__
+    tmp = _POOL_DIR / path.name
+    tmp.write_bytes(data)
+    return path_str, str(tmp), None

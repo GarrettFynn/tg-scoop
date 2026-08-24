@@ -31,6 +31,7 @@ from tg_scoop.exceptions import (
     TgScoopError,
 )
 from tg_scoop.extractor import ExtractionStats
+from tg_scoop.hardware import detect_hardware, recommended_jobs
 from tg_scoop.manifest import MANIFEST_NAME
 from tg_scoop.tdata_reader import TdataReader
 
@@ -106,9 +107,33 @@ class ScoopApp(ctk.CTk):
             text_color="gray",
         ).grid(row=4, column=0, columnspan=3, padx=8, sticky="w")
 
+        # 性能档位（C-02）：硬件检测标签 + 三档下拉，缺省均衡
+        hw = detect_hardware()
+        rec = recommended_jobs(hw)
+        cores = hw.cores or 1
+        self._jobs_map = {
+            "保守（串行）": 1,
+            f"均衡（推荐：{rec} 进程）": rec,
+            f"极速（{cores} 进程）": cores,
+        }
+        if hw.ram_gb is not None:
+            hw_text = f"检测到 {cores} 核 / RAM {hw.ram_gb:.1f} GB，推荐 {rec} 进程"
+        else:
+            hw_text = f"检测到 {cores} 核，推荐 {rec} 进程"
+        gear_row = ctk.CTkFrame(self)
+        gear_row.grid(row=5, column=0, columnspan=3, padx=8, pady=2, sticky="w")
+        ctk.CTkLabel(gear_row, text="性能档位:").pack(side="left", padx=4)
+        self._jobs_var = ctk.StringVar(value=f"均衡（推荐：{rec} 进程）")
+        ctk.CTkOptionMenu(
+            gear_row, variable=self._jobs_var, values=list(self._jobs_map)
+        ).pack(side="left", padx=4)
+        ctk.CTkLabel(gear_row, text=hw_text, text_color="gray").pack(
+            side="left", padx=8
+        )
+
         # 按钮行：开始 / 取消 / 打开目录 / 导出报告
         button_row = ctk.CTkFrame(self)
-        button_row.grid(row=5, column=0, columnspan=3, padx=8, pady=8)
+        button_row.grid(row=6, column=0, columnspan=3, padx=8, pady=8)
         self._start_button = ctk.CTkButton(
             button_row, text="开始提取", command=self._start_extraction
         )
@@ -130,21 +155,21 @@ class ScoopApp(ctk.CTk):
 
         self._progress_bar = ctk.CTkProgressBar(self)
         self._progress_bar.grid(
-            row=6, column=0, columnspan=3, padx=8, pady=4, sticky="ew"
+            row=7, column=0, columnspan=3, padx=8, pady=4, sticky="ew"
         )
         self._progress_bar.set(0)
 
         self._log_box = ctk.CTkTextbox(self, state="disabled")
-        self._log_box.grid(row=7, column=0, columnspan=3, padx=8, pady=4, sticky="nsew")
+        self._log_box.grid(row=8, column=0, columnspan=3, padx=8, pady=4, sticky="nsew")
         self._set_log("\n".join(_GUIDE_LINES) + "\n")
 
         self._stats_var = ctk.StringVar(value="成功 - / 跳过 - / 失败 - / 重复 -")
         ctk.CTkLabel(self, textvariable=self._stats_var).grid(
-            row=8, column=0, columnspan=3, padx=8, pady=8
+            row=9, column=0, columnspan=3, padx=8, pady=8
         )
 
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(7, weight=1)
+        self.rowconfigure(8, weight=1)
 
     def _build_path_row(self, row: int, label: str, var: ctk.StringVar) -> None:
         """构建一行 标签 + 输入框 + 浏览按钮。"""
@@ -193,6 +218,7 @@ class ScoopApp(ctk.CTk):
             Path(tdata) if tdata else None,
             Path(self._output_var.get().strip() or "tg-scoop-output"),
             self._password_var.get() or None,
+            self._jobs_map.get(self._jobs_var.get(), 1),
         )
         self._worker = threading.Thread(
             target=self._worker_run, args=args, daemon=True
@@ -210,6 +236,7 @@ class ScoopApp(ctk.CTk):
         tdata_path: Path | None,
         output_dir: Path,
         password: str | None,
+        jobs: int,
     ) -> None:
         """worker 线程入口：跑管道，消息一律投队列，禁止触碰控件。"""
         try:
@@ -222,6 +249,7 @@ class ScoopApp(ctk.CTk):
                     (_MSG_PROGRESS, (d, t))
                 ),
                 cancel_event=self._cancel_event,
+                jobs=jobs,
             )
         except Exception as exc:  # noqa: BLE001 —— 有意兜底：异常必须全量泵回主线程（§11.2-4）
             self._queue.put((_MSG_ERROR, exc))
