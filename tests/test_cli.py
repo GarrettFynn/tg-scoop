@@ -40,7 +40,7 @@ def test_end_to_end_dual_cache_dirs(tmp_path):
     out = tmp_path / "out"
     code = main(["--tdata-path", str(tdata), "--output-dir", str(out)])
     assert code == EXIT_OK
-    outputs = list(out.iterdir())
+    outputs = [p for p in out.iterdir() if p.name != "manifest.json"]
     # media_cache 中的文件与 cache 内容相同 -> 跨目录去重，只落盘一次
     assert len(outputs) == 2
     contents = [p.read_bytes() for p in outputs]
@@ -85,7 +85,7 @@ def test_chat_id_reserved_warning(tmp_path):
     code = main(["--tdata-path", str(tdata), "--output-dir", str(out),
                  "--chat-id", "12345"])
     assert code == EXIT_OK
-    assert len(list(out.iterdir())) == 1
+    assert len([p for p in out.iterdir() if p.name != "manifest.json"]) == 1
 
 
 def test_run_pipeline_happy_path(tmp_path):
@@ -99,7 +99,7 @@ def test_run_pipeline_happy_path(tmp_path):
     stats = run_pipeline(tdata, out, None, progress_cb=lines.append)
     assert stats.succeeded == 1 and stats.failed == 0
     assert any("LocalKey" in line for line in lines)
-    assert next(out.iterdir()).read_bytes() == _PNG_DATA
+    assert next(p for p in out.iterdir() if p.suffix == ".png").read_bytes() == _PNG_DATA
 
 
 def test_run_pipeline_error_paths(tmp_path):

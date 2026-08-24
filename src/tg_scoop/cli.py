@@ -22,6 +22,7 @@ from tg_scoop.exceptions import (
     TgScoopError,
 )
 from tg_scoop.extractor import ExtractionStats, Extractor
+from tg_scoop.manifest import write_manifest
 from tg_scoop.tdata_reader import TdataReader
 
 # 退出码（DEVELOPMENT.md §7.2）
@@ -140,6 +141,15 @@ def run_pipeline(
             total.merge(extractor.extract_all(cache_dir, output_dir))
         except CacheNotFoundError as exc:
             log(f"跳过：{exc}")
+    manifest_path = write_manifest(
+        output_dir,
+        tdata_path=tdata_path,
+        stats=total,
+        extracted=extractor.extracted_entries,
+        skipped=extractor.skipped_entries,
+        failed=extractor.failed_entries,
+    )
+    log(f"manifest 已写入：{manifest_path}")
     return total
 
 

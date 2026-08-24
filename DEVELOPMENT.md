@@ -847,6 +847,25 @@ class RateLimiter:
 3. `unique_path()` 的序号探测上限 9999，耗尽抛 `ExtractionError`
    ——无限循环比报错更难排查。
 
+### 6.3 manifest（N-1，B-01 落地）
+
+每次提取运行结束，在输出目录写 `manifest.json`（结构版本
+`version: 1`），含 `tdata_path`/`generated_at`/`stats` 与三段条目：
+
+- `entries`：落盘记录（file_name、明文 sha256 hex、size、mtime
+  （本地朴素 ISO 秒级）、media_type、source_cache_dir）
+- `skipped_entries`：未落盘记录（cache_file、source_cache_dir、
+  reason ∈ `unrecognized_media_type` / `duplicate`）
+- `failed_entries`：解密失败记录（cache_file、source_cache_dir、
+  reason = 异常类型名）
+
+口径契约：`len(entries) == stats.succeeded`；
+`len(skipped_entries) == stats.skipped + stats.duplicates`；
+`len(failed_entries) == stats.failed`。
+
+幂等语义：manifest.json 是工具自身的报告，每轮**覆盖重写**，内容
+反映本轮事实——"绝不覆盖"红线针对提取出的媒体文件，不含报告自身。
+
 ---
 
 ## 7. 错误处理规范

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from tg_scoop.cache_decryptor import CacheDecryptor, iter_cache_files
 from tg_scoop.exceptions import DecryptionError, ExtractionError
+from tg_scoop.manifest import ExtractedEntry, FailedEntry, SkippedEntry
 from tg_scoop.media_detector import SNIFF_LEN, MediaDetector, MediaType
 
 MAX_NAME_ATTEMPTS = 9999
@@ -175,6 +176,10 @@ class Extractor:
         self._decryptor = decryptor
         self._detector = detector or MediaDetector()
         self._seen: set[bytes] = set()  # 本次运行内已落盘的明文 SHA-256
+        # manifest 记录（N-1）：由 extract_all 逐分支追加，run_pipeline 统一落盘
+        self.extracted_entries: list[ExtractedEntry] = []
+        self.skipped_entries: list[SkippedEntry] = []
+        self.failed_entries: list[FailedEntry] = []
 
     def extract_all(self, cache_dir: Path, out_dir: Path) -> ExtractionStats:
         """对 cache 目录执行完整提取流程。
@@ -197,6 +202,7 @@ class Extractor:
         stats = ExtractionStats()
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        source_name = Path(cache_dir).name  # manifest 来源目录字段："cache" / "media_cache"
 
         for path in iter_cache_files(cache_dir):
             try:
@@ -205,16 +211,25 @@ class Extractor:
                 stats.failed += 1
                 reason = type(exc).__name__
                 stats.failed_reasons[reason] = stats.failed_reasons.get(reason, 0) + 1
+                self.failed_entries.append(
+                    FailedEntry(path.name, source_name, reason)
+                )
                 continue
 
             media_type = self._detector.sniff(data[:SNIFF_LEN])
             if media_type is None:
                 stats.skipped += 1
+                self.skipped_entries.append(
+                    SkippedEntry(path.name, source_name, "unrecognized_media_type")
+                )
                 continue
 
             digest = hashlib.sha256(data).digest()
             if self._is_duplicate(digest):
                 stats.duplicates += 1
+                self.skipped_entries.append(
+                    SkippedEntry(path.name, source_name, "duplicate")
+                )
                 continue
 
             # §6.1 要求本地时区朴素时间：naive datetime 是有意选择，不加 tz
@@ -227,11 +242,24 @@ class Extractor:
             if target.exists() and self._file_digest(target) == digest:
                 self._seen.add(digest)
                 stats.duplicates += 1
+                self.skipped_entries.append(
+                    SkippedEntry(path.name, source_name, "duplicate")
+                )
                 continue
 
             save_media(data, out_dir, name, mtime)  # OSError 上抛
             self._seen.add(digest)
             stats.succeeded += 1
+            self.extracted_entries.append(
+                ExtractedEntry(
+                    file_name=name,
+                    sha256=digest.hex(),
+                    size=len(data),
+                    mtime=mtime.isoformat(timespec="seconds"),
+                    media_type=media_type.value,
+                    source_cache_dir=source_name,
+                )
+            )
 
         return stats
 

@@ -75,4 +75,4 @@ def test_run_pipeline_warns_when_telegram_running(tmp_path, monkeypatch):
         "警告：检测到 Telegram Desktop 正在运行（进程 Telegram.exe）" in line
         for line in lines
     )
-    assert next(out.iterdir()).read_bytes() == _PNG_DATA
+    assert next(p for p in out.iterdir() if p.suffix == ".png").read_bytes() == _PNG_DATA
