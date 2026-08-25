@@ -35,6 +35,7 @@ from tg_scoop.extractor import (
     _pool_worker_init,
 )
 from tg_scoop.manifest import write_manifest
+from tg_scoop.media_detector import MediaType
 from tg_scoop.tdata_reader import TdataReader
 
 # 退出码（DEVELOPMENT.md §7.2）
@@ -97,6 +98,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="只读分析缓存占用（Top/最旧各 20），不提取；与提取互斥",
     )
+    parser.add_argument(
+        "--types",
+        default=None,
+        help="只输出指定类型（逗号分隔，如 mp4,jpg）；可选值："
+        + ",".join(t.value for t in MediaType)
+        + "；缺省全选",
+    )
     return parser
 
 
@@ -108,6 +116,7 @@ def run_pipeline(
     file_progress_cb: Callable[[int, int], None] | None = None,
     cancel_event: object | None = None,
     jobs: int = 1,
+    allowed_types: set[MediaType] | None = None,
 ) -> ExtractionStats:
     """共享提取管道：定位 tdata -> 派生 LocalKey -> 双缓存目录提取。
 
@@ -130,6 +139,9 @@ def run_pipeline(
         jobs: 并行解密进程数（C-02）；1=串行（默认，行为与旧版一致）。
             >1 时 worker 进程只解密写池内临时文件，主进程按排序序
             保序消费——输出与串行逐字节一致（确定性红线）。
+        allowed_types: 可选输出类型过滤集合（C-13）；None=全选
+            （现状行为），集合外类型计入 skipped 并记
+            ``filtered_by_type:{类型}``。
 
     Returns:
         合并后的提取统计；取消时为部分统计。
@@ -167,7 +179,7 @@ def run_pipeline(
         )
 
     # 共享一个 Extractor 实例：跨目录内容去重因此生效
-    extractor = Extractor(CacheDecryptor(local_key))
+    extractor = Extractor(CacheDecryptor(local_key), allowed_types=allowed_types)
     total = ExtractionStats()
     # 预数总文件数（空缓存目录与提取循环同语义：跳过不计）
     total_files = 0
@@ -336,11 +348,19 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_NOT_FOUND
         return EXIT_OK
 
+    allowed = None
+    if args.types:
+        try:
+            allowed = {MediaType(t.strip().lower()) for t in args.types.split(",")}
+        except ValueError as exc:
+            print(f"错误：--types 含未知类型（{exc}）", file=sys.stderr)
+            return EXIT_NOT_FOUND  # 参数错误复用退出码 2 口径
+
     try:
         try:
             total = run_pipeline(
                 args.tdata_path, args.output_dir, args.password,
-                progress_cb=print, jobs=args.jobs,
+                progress_cb=print, jobs=args.jobs, allowed_types=allowed,
             )
         except PasswordRequiredError:
             # 未提供密码但 tdata 设有本地密码：交互询问一次后重试
@@ -349,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise PasswordRequiredError("passcode input cancelled")
             total = run_pipeline(
                 args.tdata_path, args.output_dir, entered,
-                progress_cb=print, jobs=args.jobs,
+                progress_cb=print, jobs=args.jobs, allowed_types=allowed,
             )
     except (PasswordRequiredError, DecryptionError) as exc:
         print(f"错误：密钥派生失败（{exc}）", file=sys.stderr)

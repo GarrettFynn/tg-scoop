@@ -171,15 +171,20 @@ class Extractor:
         self,
         decryptor: CacheDecryptor,
         detector: MediaDetector | None = None,
+        allowed_types: set[MediaType] | None = None,
     ) -> None:
         """初始化提取器。
 
         Args:
             decryptor: 持有 LocalKey 的缓存解密器。
             detector: 媒体嗅探器；None 时创建默认实例。
+            allowed_types: 可选输出类型过滤集合（C-13）；None=不过滤
+                （现状行为），命中集合外类型计入 skipped 并记
+                ``filtered_by_type:{类型}``。
         """
         self._decryptor = decryptor
         self._detector = detector or MediaDetector()
+        self._allowed_types = allowed_types
         self._seen: set[bytes] = set()  # 本次运行内已落盘的明文 SHA-256
         # manifest 记录（N-1）：由 extract_all 逐分支追加，run_pipeline 统一落盘
         self.extracted_entries: list[ExtractedEntry] = []
@@ -254,6 +259,13 @@ class Extractor:
                 stats.skipped += 1
                 self.skipped_entries.append(
                     SkippedEntry(path.name, source_name, "unrecognized_media_type")
+                )
+                return
+            if self._allowed_types is not None and media_type not in self._allowed_types:
+                # 类型过滤（C-13）：与未识别同样早停，不读余量、不落盘
+                stats.skipped += 1
+                self.skipped_entries.append(
+                    SkippedEntry(path.name, source_name, f"filtered_by_type:{media_type.value}")
                 )
                 return
             # 识别为媒体：解密 -> 哈希 -> 写临时文件一趟完成
@@ -395,6 +407,14 @@ class Extractor:
             stats.skipped += 1
             self.skipped_entries.append(
                 SkippedEntry(path.name, source_name, "unrecognized_media_type")
+            )
+            return
+        if self._allowed_types is not None and media_type not in self._allowed_types:
+            # 类型过滤（C-13）：删除池文件，与未识别分支同构
+            tmp_path.unlink(missing_ok=True)
+            stats.skipped += 1
+            self.skipped_entries.append(
+                SkippedEntry(path.name, source_name, f"filtered_by_type:{media_type.value}")
             )
             return
         hasher = hashlib.sha256()

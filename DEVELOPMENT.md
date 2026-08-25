@@ -868,7 +868,8 @@ class RateLimiter:
 - `entries`：落盘记录（file_name、明文 sha256 hex、size、mtime
   （本地朴素 ISO 秒级）、media_type、source_cache_dir）
 - `skipped_entries`：未落盘记录（cache_file、source_cache_dir、
-  reason ∈ `unrecognized_media_type` / `duplicate`）
+  reason ∈ `unrecognized_media_type` / `duplicate` /
+  `filtered_by_type:{type}`（C-13，v0.1.4））
 - `failed_entries`：解密失败记录（cache_file、source_cache_dir、
   reason = 异常类型名）
 

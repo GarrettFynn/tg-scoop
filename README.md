@@ -63,6 +63,7 @@ tg-scoop --password "your-passcode"
 | `--output-dir` | 输出目录；缺省 `./tg-scoop-output` |
 | `--password` | tdata 本地密码；未提供且需要时会交互询问 |
 | `--jobs` | 并行解密进程数；缺省 `1`（串行，保守）；推荐档位见下表 |
+| `--types` | 只输出指定类型（逗号分隔，如 `mp4,jpg`）；可选 mp4,webm,avi,mkv,mov,jpg,png,gif,webp；缺省全选。GUI 用法：类型复选框勾选，全不勾不允许开始 |
 | `--analyze` | 只读分析缓存占用（Top/最旧各 20 + 清理建议），不提取、不写盘 |
 | `--chat-id` | 【v0.2 预留】按聊天过滤；当前版本忽略并给出警告 |
 

@@ -33,6 +33,7 @@ from tg_scoop.exceptions import (
 from tg_scoop.extractor import ExtractionStats
 from tg_scoop.hardware import detect_hardware, recommended_jobs
 from tg_scoop.manifest import MANIFEST_NAME
+from tg_scoop.media_detector import MediaType
 from tg_scoop.tdata_reader import TdataReader
 
 # worker -> 主线程的消息类型
@@ -107,6 +108,21 @@ class ScoopApp(ctk.CTk):
             text_color="gray",
         ).grid(row=4, column=0, columnspan=3, padx=8, sticky="w")
 
+        # 输出类型区（C-13）：9 个复选框，默认全勾；全不勾不允许开始
+        types_frame = ctk.CTkFrame(self)
+        types_frame.grid(row=5, column=0, columnspan=3, padx=8, pady=2, sticky="w")
+        ctk.CTkLabel(types_frame, text="输出类型:").grid(
+            row=0, column=0, rowspan=2, padx=4
+        )
+        self._type_vars: dict[MediaType, ctk.BooleanVar] = {}
+        self._type_boxes: list[ctk.CTkCheckBox] = []
+        for i, media_type in enumerate(MediaType):
+            var = ctk.BooleanVar(value=True)
+            box = ctk.CTkCheckBox(types_frame, text=media_type.value, variable=var)
+            box.grid(row=i // 5, column=i % 5 + 1, padx=4, pady=2)
+            self._type_vars[media_type] = var
+            self._type_boxes.append(box)
+
         # 性能档位（C-02）：硬件检测标签 + 三档下拉，缺省均衡
         hw = detect_hardware()
         rec = recommended_jobs(hw)
@@ -121,7 +137,7 @@ class ScoopApp(ctk.CTk):
         else:
             hw_text = f"检测到 {cores} 核，推荐 {rec} 进程"
         gear_row = ctk.CTkFrame(self)
-        gear_row.grid(row=5, column=0, columnspan=3, padx=8, pady=2, sticky="w")
+        gear_row.grid(row=6, column=0, columnspan=3, padx=8, pady=2, sticky="w")
         ctk.CTkLabel(gear_row, text="性能档位:").pack(side="left", padx=4)
         self._jobs_var = ctk.StringVar(value=f"均衡（推荐：{rec} 进程）")
         ctk.CTkOptionMenu(
@@ -133,7 +149,7 @@ class ScoopApp(ctk.CTk):
 
         # 按钮行：开始 / 取消 / 打开目录 / 导出报告
         button_row = ctk.CTkFrame(self)
-        button_row.grid(row=6, column=0, columnspan=3, padx=8, pady=8)
+        button_row.grid(row=7, column=0, columnspan=3, padx=8, pady=8)
         self._start_button = ctk.CTkButton(
             button_row, text="开始提取", command=self._start_extraction
         )
@@ -155,21 +171,21 @@ class ScoopApp(ctk.CTk):
 
         self._progress_bar = ctk.CTkProgressBar(self)
         self._progress_bar.grid(
-            row=7, column=0, columnspan=3, padx=8, pady=4, sticky="ew"
+            row=8, column=0, columnspan=3, padx=8, pady=4, sticky="ew"
         )
         self._progress_bar.set(0)
 
         self._log_box = ctk.CTkTextbox(self, state="disabled")
-        self._log_box.grid(row=8, column=0, columnspan=3, padx=8, pady=4, sticky="nsew")
+        self._log_box.grid(row=9, column=0, columnspan=3, padx=8, pady=4, sticky="nsew")
         self._set_log("\n".join(_GUIDE_LINES) + "\n")
 
         self._stats_var = ctk.StringVar(value="成功 - / 跳过 - / 失败 - / 重复 -")
         ctk.CTkLabel(self, textvariable=self._stats_var).grid(
-            row=9, column=0, columnspan=3, padx=8, pady=8
+            row=10, column=0, columnspan=3, padx=8, pady=8
         )
 
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(8, weight=1)
+        self.rowconfigure(9, weight=1)
 
     def _build_path_row(self, row: int, label: str, var: ctk.StringVar) -> None:
         """构建一行 标签 + 输入框 + 浏览按钮。"""
@@ -196,18 +212,29 @@ class ScoopApp(ctk.CTk):
                 row=1, column=0, columnspan=3, padx=8, sticky="w"
             )
 
+    def _selected_types(self) -> set[MediaType] | None:
+        """收集类型勾选项：全勾返回 None（现状行为），否则返回集合。"""
+        selected = {t for t, var in self._type_vars.items() if var.get()}
+        return None if len(selected) == len(self._type_vars) else selected
+
     # ------------------------------------------------------------------
     # 提取流程（线程模型见 §11.2）
     # ------------------------------------------------------------------
 
     def _start_extraction(self) -> None:
-        """点击开始：置灰按钮、清空日志、进度归零、启动 worker 线程。"""
+        """点击开始：置灰控件、清空日志、进度归零、启动 worker 线程。"""
         if self._worker is not None and self._worker.is_alive():
             return  # 防重入（按钮置灰之外的兜底）
+        selected = self._selected_types()
+        if selected is not None and not selected:
+            self._append_log("请至少选择一种输出类型")
+            return  # 全不勾：提示且不发起提取（按钮不置灰）
         self._start_button.configure(state="disabled")
         self._cancel_button.configure(state="normal")
         self._open_button.configure(state="disabled")
         self._export_button.configure(state="disabled")
+        for box in self._type_boxes:
+            box.configure(state="disabled")
         self._progress_bar.set(0)
         self._set_log("")
         self._stats_var.set("成功 - / 跳过 - / 失败 - / 重复 -")
@@ -219,6 +246,7 @@ class ScoopApp(ctk.CTk):
             Path(self._output_var.get().strip() or "tg-scoop-output"),
             self._password_var.get() or None,
             self._jobs_map.get(self._jobs_var.get(), 1),
+            selected,
         )
         self._worker = threading.Thread(
             target=self._worker_run, args=args, daemon=True
@@ -237,6 +265,7 @@ class ScoopApp(ctk.CTk):
         output_dir: Path,
         password: str | None,
         jobs: int,
+        allowed_types: set[MediaType] | None,
     ) -> None:
         """worker 线程入口：跑管道，消息一律投队列，禁止触碰控件。"""
         try:
@@ -250,6 +279,7 @@ class ScoopApp(ctk.CTk):
                 ),
                 cancel_event=self._cancel_event,
                 jobs=jobs,
+                allowed_types=allowed_types,
             )
         except Exception as exc:  # noqa: BLE001 —— 有意兜底：异常必须全量泵回主线程（§11.2-4）
             self._queue.put((_MSG_ERROR, exc))
@@ -280,6 +310,8 @@ class ScoopApp(ctk.CTk):
         else:
             self._start_button.configure(state="normal")
             self._cancel_button.configure(state="disabled")
+            for box in self._type_boxes:
+                box.configure(state="normal")
 
     # ------------------------------------------------------------------
     # UI 更新与辅助动作（只在主线程被调用）
