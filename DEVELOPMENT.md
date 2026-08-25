@@ -445,20 +445,27 @@ golden 文件锚定已补做：`tests/golden/golden_vectors.json`（由
 权限不足）意味着后续所有文件都会失败，继续跑只是浪费时间的
 假进度，应立即中止并给出非零退出码。
 
-### 2.3 关于 map 文件的说明
+### 2.3 缓存索引：binlog 定案（B-03，v0.2）
 
-`cache/map0`、`cache/map1` 是 tdesktop 的缓存索引（TDF$ 加密，用
-LocalKey 可解），记录了 cache key → 文件名/大小/存储位置的映射。
-v0.1 不解析它，直接暴力遍历解密全部文件，理由：
+> 旧版假设（`cache/map0`、`cache/map1` 为索引文件）已被真机探测
+> 证伪，登记为漂移项 **D-7.1.1-2**：tdesktop 7.1.1 的
+> cache/media_cache 下不存在 map0/map1（旧版"map 格式随版本漂移"
+> 预判以极端形式应验）。
 
-1. map 的内部二进制格式（`Storage::Cache::details`）随版本漂移，
-   逆向成本高；
-2. 参考实现（lilydjwg / Zwylair）均不解析 map，实践证明暴力遍历
-   足以达到 MVP 目标；
-3. 解密失败项本来就会被 ⑤⑥ 过滤，不会污染输出。
+7.x 缓存索引真身 = `<cache目录>/<version>/binlog`（lib_storage 子
+模块，`storage_cache_types.h` / `storage_cache_binlog_reader.h` /
+`storage_cache_database_object.cpp`）：`version` 文件（4B 小端
+int32）记录版本号目录名；binlog 为 TDEF 加密容器（与媒体文件同族，
+`decrypt_file` 可解）；内容 = BasicHeader(16B) + 记录流
+（Store 0x01 / MultiStore 0x02 / MultiRemove 0x03 / MultiAccess 0x04）。
+数据文件按 placeId（7 字节 → 14 位十六进制，低 4 位在前高 4 位
+在后，首字节两字符后插 `/`）命名，如 `cache/1/A5/5B40637E62FA`。
 
-v0.2 接入 MTProto 后，map 中的 cache key 可用于与 `document.id`
-关联，届时再实现 `read_cache_map()`。
+`cache_index.py`（B-03 落地）提供只读 `read_cache_index()`：
+解析出 `Key(16B) → {place 路径, tag, size, checksum, use_time}`
+映射，供 B-04 三级匹配的 P1 级（document.id 精确匹配）使用；
+未知记录类型/版本显式失败（漂移暴露原则）。v0.1 的暴力遍历路径
+不受影响（索引只服务 v0.2 的匹配增强，不参与提取主流程）。
 
 ---
 
