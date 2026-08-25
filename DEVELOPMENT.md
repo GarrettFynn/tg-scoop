@@ -754,7 +754,10 @@ int32   keys_to_destroy_count（同上结构，丢弃不用）
 
 提取出的 `(user_id, dc_id, auth_key)` 可直接构造 Telethon/Pyrogram
 会话，**无需扫码或短信验证**——这是复用本地会话而非新建登录，
-不触发新设备通知。接口：
+不触发新设备通知。
+
+> B-02 已落地 `mtproto_client.py`（MemorySession 复用 + DC 地址表 +
+> chat 解析/实体解析，telethon 延迟 import）；真实会话验证归 H-04。接口：
 
 ```python
 @dataclass

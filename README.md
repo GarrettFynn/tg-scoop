@@ -77,6 +77,8 @@ tg-scoop --password "your-passcode"
 
 **使用前提**：先在 Telegram Desktop 中完整播放/查看目标媒体（确保写入本地缓存），然后**完全退出** Telegram Desktop 再运行本工具。
 
+**v0.2 前置条件（MTProto 功能，规划中）**：会话复用类功能需要 `pip install .[mtproto]` 安装可选依赖，并在 https://my.telegram.org 注册应用获得 api_id/api_hash（真实会话验证用；本轮功能为基础设施，不涉及消息拉取）。
+
 ## 输出与退出码
 
 运行结束打印统计：`成功 N，跳过 M（非媒体），失败 K，重复 D`。

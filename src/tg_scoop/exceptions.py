@@ -44,3 +44,7 @@ class APIRateLimitError(TgScoopError):
 
 class ExtractionError(TgScoopError):
     """输出阶段错误（如命名序号耗尽）。"""
+
+
+class MtprotoError(TgScoopError):
+    """MTProto 会话复用相关错误（B-02，v0.2）。"""
