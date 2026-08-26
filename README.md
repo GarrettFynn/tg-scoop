@@ -4,23 +4,32 @@
 
 Telegram 私密群组/频道开启"限制保存"后，另存为与转发被禁用，但播放过的媒体仍会加密缓存在本地（`tdata/user_data/cache/`）。tg-scoop 把这些**已经缓存在你自己硬盘上**的文件解密出来。
 
+详细使用指南见 [USAGE.md](USAGE.md)。
+
 ## 核心原则
 
 - 只做本地数据提取：不破解 Telegram 服务器、不预置代理、不托管内容
 - **只读 tdata**：绝不修改 tdata 目录内的任何字节
 - **绝不覆盖已有文件**：输出冲突时自动加序号后缀；重复运行幂等（不重复、不覆盖）
 
-## 功能（v0.1）
+## 功能（v0.1.5）
 
 - **CLI + 简洁图形界面双入口**（GUI 基于 CustomTkinter，不会命令行也能用）
-- 解密 `tdata` 本地密钥并还原 TDEF 加密缓存（AES-256-IGE/CTR，纯 Python 实现，无 PyQt/OpenSSL 依赖）
+- 解密 `tdata` 本地密钥并还原 TDEF 加密缓存（AES-256-IGE/CTR，pycryptodome 加速，无 PyQt/OpenSSL 依赖）
 - 通过 magic bytes 识别 9 种媒体类型：MP4 / WEBM / AVI / MKV / MOV / JPEG / PNG / GIF / WEBP
 - 同时处理 `user_data/cache/` 与 `user_data/media_cache/` 两个缓存目录
 - 确定性命名 `{sender}_{时间戳}_{哈希前8位}.{扩展名}`，支持安全地重复运行（增量提取）
 - 保留缓存文件的修改时间（mtime），便于按时间排序找回内容
 - 支持设有本地密码（Local Passcode）的 tdata
+- 输出类型过滤（`--types` / GUI 复选框）与性能档位（`--jobs` / GUI 下拉）
+- C 级 AES-CTR 后端：实测约 2.8 万缓存文件串行提取 73 秒（较纯 Python 实现提速 ≈6.8×）
+- `--analyze` 只读缓存占用分析（Top/最旧各 20 + 清理建议）
+- 每次运行生成 `manifest.json` 提取清单（落盘/跳过/失败条目全记录）
+- Telegram 未退净时醒目警告（不阻断，是否继续由你承担）
 
-> 规划中（v0.2）：复用本地 MTProto 会话拉取消息历史，恢复原始文件名。设计见 [DEVELOPMENT.md](DEVELOPMENT.md) §5。
+### 实验性功能（v0.2 预览，未经真实环境验证）
+
+- `--chat-id` + `--api-id`/`--api-hash`：消息匹配（三级置信度）、原始文件名命名、断点续跑、API 限速（≤30/分钟，FloodWait 安全停止）。需 `pip install .[mtproto]` 与 my.telegram.org 注册凭据；详见 [USAGE.md](USAGE.md) 第八节。
 
 ## 安装
 
