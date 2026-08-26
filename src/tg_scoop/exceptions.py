@@ -39,7 +39,10 @@ class MediaTypeError(TgScoopError):
 
 
 class APIRateLimitError(TgScoopError):
-    """【v0.2】触发 Telegram FloodWait，需要等待后重试。"""
+    """触发 Telegram API 限速（FloodWait）（B-05，v0.2）。
+
+    由 rate_limiter.run_with_floodwait 在按秒数暂停后抛出，CLI 映射
+    退出码 4。"""
 
 
 class ExtractionError(TgScoopError):

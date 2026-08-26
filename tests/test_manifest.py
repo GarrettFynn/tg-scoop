@@ -37,7 +37,7 @@ def test_manifest_fields_and_stats(tmp_path):
     stats = run_pipeline(tdata, out, None)
 
     doc = _read_manifest(out)
-    assert doc["version"] == 1
+    assert doc["version"] == 2  # B-04：manifest v2（新增字段可选，v1 兼容）
     assert doc["tdata_path"] == str(tdata)
     assert doc["stats"] == {
         "succeeded": stats.succeeded,

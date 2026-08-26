@@ -804,6 +804,15 @@ class TdataReader:
 保持高置信度；P3 完全不碰网络。逐级降级保证绝大多数文件在前
 两级解决，API 调用量最小化——这直接决定了限速预算够不够用。
 
+> 落地注（B-04，v0.2 施工中）：`message_matcher.py` 提供
+> `DocumentInfo`/`MatchResult`/`document_cache_key`（+
+> `document_bigfile_cache_key`，media_cache 大文件基准键，取证自
+> `image_location.cpp`）/`fetch_chat_documents`/`match_documents`/
+> `match_with_content`；cache key 公式来自 data_types.cpp
+> （`Key{0x100 | (dcId & 0xFF), id}`）；binlog 索引见 §2.3
+> （`read_cache_index`）；匹配结果写入 manifest v2（§6.3），
+> 命名不变（B-07 才生效）。真实连接验证归 H-04。
+
 ### 5.3 API 限速策略
 
 硬性约束：**≤ 30 条消息/分钟**（远高于官方 FloodWait 触发阈值，
@@ -873,10 +882,12 @@ class RateLimiter:
 ### 6.3 manifest（N-1，B-01 落地）
 
 每次提取运行结束，在输出目录写 `manifest.json`（结构版本
-`version: 1`），含 `tdata_path`/`generated_at`/`stats` 与三段条目：
+`version: 2`），含 `tdata_path`/`generated_at`/`stats` 与三段条目：
 
 - `entries`：落盘记录（file_name、明文 sha256 hex、size、mtime
-  （本地朴素 ISO 秒级）、media_type、source_cache_dir）
+  （本地朴素 ISO 秒级）、media_type、source_cache_dir）；
+  B-04 匹配运行时命中条目增 `match` 子对象
+  （`{"level", "document_id", "original_name"}`）
 - `skipped_entries`：未落盘记录（cache_file、source_cache_dir、
   reason ∈ `unrecognized_media_type` / `duplicate` /
   `filtered_by_type:{type}`（C-13，v0.1.4））
@@ -886,6 +897,10 @@ class RateLimiter:
 口径契约：`len(entries) == stats.succeeded`；
 `len(skipped_entries) == stats.skipped + stats.duplicates`；
 `len(failed_entries) == stats.failed`。
+
+v2 增量（B-04）：带 `matches` 写盘时顶层增 `match_summary`
+（`{"P1": n, "P2": n, "P3": n}`）；不带 matches 的旧路径结构不变。
+版本 1 → 2 为纯新增字段，旧读取方兼容。
 
 幂等语义：manifest.json 是工具自身的报告，每轮**覆盖重写**，内容
 反映本轮事实——"绝不覆盖"红线针对提取出的媒体文件，不含报告自身。
@@ -916,7 +931,7 @@ class CorruptedDataError(DecryptionError):
     """TDF 容器级损坏（magic/MD5 校验失败）。"""
 
 class APIRateLimitError(TgScoopError):
-    """【v0.2】触发 FloodWait，需要等待后重试。"""
+    """触发 Telegram API 限速（FloodWait）（B-05，v0.2）。"""
 
 class ExtractionError(TgScoopError):
     """命名序号耗尽等输出阶段错误。"""

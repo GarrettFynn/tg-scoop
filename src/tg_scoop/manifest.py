@@ -14,8 +14,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # 避免与 extractor 循环导入（extractor 引用本模块的记录类型）
     from tg_scoop.extractor import ExtractionStats
+    from tg_scoop.message_matcher import MatchResult
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 MANIFEST_NAME = "manifest.json"
 
 
@@ -57,6 +58,7 @@ def write_manifest(
     extracted: list[ExtractedEntry],
     skipped: list[SkippedEntry],
     failed: list[FailedEntry],
+    matches: "list[MatchResult] | None" = None,
 ) -> Path:
     """在输出目录写 manifest.json（覆盖重写），返回其路径。
 
@@ -66,9 +68,15 @@ def write_manifest(
     generated_at 用本地朴素时间是有意选择，与 entries 的 mtime
     字段及 §6.1 命名时间戳同口径（先例 extractor.py 的 noqa: DTZ006）。
 
+    matches（B-04，version 2）：非空时按 ``file_name`` 关联到对应
+    entry 增 ``"match": {"level", "document_id", "original_name"}``
+    子对象，并在顶层增 ``"match_summary": {"P1": n, "P2": n, "P3": n}``；
+    不带 matches 的旧路径输出结构与 version 1 一致（仅版本号递增）。
+
     Raises:
         OSError: 写盘失败（与提取写盘同一语义，调用方应中止）。
     """
+    entries = [asdict(e) for e in extracted]
     doc = {
         "version": MANIFEST_VERSION,
         "tdata_path": str(tdata_path),
@@ -79,10 +87,28 @@ def write_manifest(
             "failed": stats.failed,
             "duplicates": stats.duplicates,
         },
-        "entries": [asdict(e) for e in extracted],
+        "entries": entries,
         "skipped_entries": [asdict(e) for e in skipped],
         "failed_entries": [asdict(e) for e in failed],
     }
+    if matches:
+        by_name = {}
+        for m in matches:
+            if m.file_name is not None:
+                by_name[m.file_name] = {
+                    "level": m.level,
+                    "document_id": m.document_id,
+                    "original_name": m.original_name,
+                }
+        for entry in entries:
+            match = by_name.get(entry["file_name"])
+            if match is not None:
+                entry["match"] = match
+        summary = {"P1": 0, "P2": 0, "P3": 0}
+        for m in matches:
+            if m.level in summary:
+                summary[m.level] += 1
+        doc["match_summary"] = summary
     path = Path(out_dir) / MANIFEST_NAME
     path.write_text(
         json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

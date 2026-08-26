@@ -65,7 +65,7 @@ tg-scoop --password "your-passcode"
 | `--jobs` | 并行解密进程数；缺省 `1`（串行，保守）；推荐档位见下表 |
 | `--types` | 只输出指定类型（逗号分隔，如 `mp4,jpg`）；可选 mp4,webm,avi,mkv,mov,jpg,png,gif,webp；缺省全选。GUI 用法：类型复选框勾选，全不勾不允许开始 |
 | `--analyze` | 只读分析缓存占用（Top/最旧各 20 + 清理建议），不提取、不写盘 |
-| `--chat-id` | 【v0.2 预留】按聊天过滤；当前版本忽略并给出警告 |
+| `--chat-id` | 【实验性】按聊天做消息匹配（需配合 `--api-id`/`--api-hash`）；只标注 manifest，命名生效在后续版本。缺凭据时忽略并警告 |
 
 性能档位（GUI 下拉同义；并行输出与串行逐字节一致，只影响速度）：
 
@@ -77,7 +77,7 @@ tg-scoop --password "your-passcode"
 
 **使用前提**：先在 Telegram Desktop 中完整播放/查看目标媒体（确保写入本地缓存），然后**完全退出** Telegram Desktop 再运行本工具。
 
-**v0.2 前置条件（MTProto 功能，规划中）**：会话复用类功能需要 `pip install .[mtproto]` 安装可选依赖，并在 https://my.telegram.org 注册应用获得 api_id/api_hash（真实会话验证用；本轮功能为基础设施，不涉及消息拉取）。
+**v0.2 前置条件（MTProto 功能，规划中）**：会话复用类功能需要 `pip install .[mtproto]` 安装可选依赖，并在 https://my.telegram.org 注册应用获得 api_id/api_hash（真实会话验证用；本轮功能为基础设施，不涉及消息拉取）。消息匹配（`--chat-id` + api 凭据）为实验性：一切 API 调用走令牌桶限速（≤30 条/分钟硬约束），触发 FloodWait 必按秒数暂停后安全停止（退出码 4，可稍后重跑）。
 
 ## 输出与退出码
 
@@ -91,7 +91,7 @@ tg-scoop --password "your-passcode"
 | 1 | 系统性故障（如磁盘写失败），已中止 |
 | 2 | 找不到 tdata 目录或缓存目录 |
 | 3 | 需要密码或密码错误 |
-| 4 | 【v0.2】API 限速 |
+| 4 | API 限速（FloodWait），已按秒数暂停并安全停止，可稍后重跑 |
 
 ## FAQ
 

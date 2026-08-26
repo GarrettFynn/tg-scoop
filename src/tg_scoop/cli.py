@@ -7,11 +7,15 @@
 """
 
 import argparse
+import asyncio
 import getpass
+import hashlib
+import json
 import multiprocessing
 import shutil
 import sys
 from collections.abc import Callable
+from dataclasses import replace as dc_replace
 from datetime import datetime
 from pathlib import Path
 
@@ -21,9 +25,12 @@ from tg_scoop.cache_decryptor import (
     CacheDecryptor,
     iter_cache_files,
 )
+from tg_scoop.cache_index import read_cache_index
 from tg_scoop.exceptions import (
+    APIRateLimitError,
     CacheNotFoundError,
     DecryptionError,
+    MtprotoError,
     PasswordRequiredError,
     TDataNotFoundError,
     TgScoopError,
@@ -34,8 +41,24 @@ from tg_scoop.extractor import (
     _pool_decrypt_one,
     _pool_worker_init,
 )
-from tg_scoop.manifest import write_manifest
+from tg_scoop.manifest import (
+    MANIFEST_NAME,
+    ExtractedEntry,
+    FailedEntry,
+    SkippedEntry,
+    write_manifest,
+)
 from tg_scoop.media_detector import MediaType
+from tg_scoop.message_matcher import (
+    DocumentInfo,
+    MatchResult,
+    document_bigfile_cache_key,
+    document_cache_key,
+    fetch_chat_documents,
+    match_with_content,
+)
+from tg_scoop.mtproto_client import connect, parse_chat_id, resolve_entity
+from tg_scoop.rate_limiter import RateLimiter
 from tg_scoop.tdata_reader import TdataReader
 
 # 退出码（DEVELOPMENT.md §7.2）
@@ -104,6 +127,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="只输出指定类型（逗号分隔，如 mp4,jpg）；可选值："
         + ",".join(t.value for t in MediaType)
         + "；缺省全选",
+    )
+    parser.add_argument(
+        "--api-id",
+        type=int,
+        default=None,
+        help="【v0.2】my.telegram.org 注册应用的 api_id（配合 --chat-id 启用消息匹配）",
+    )
+    parser.add_argument(
+        "--api-hash",
+        default=None,
+        help="【v0.2】注册应用的 api_hash（仅本地使用，不进日志/manifest）",
     )
     return parser
 
@@ -322,6 +356,128 @@ def analyze_cache(tdata_path: Path | None, log: Callable[[str], None] = print) -
     )
 
 
+def _version_dir_name(cache_dir: Path) -> str:
+    """binlog 所在版本目录名（与 cache_index._locate_binlog 同一规则）。"""
+    version_file = cache_dir / "version"
+    if version_file.is_file():
+        raw = version_file.read_bytes()
+        if len(raw) == 4:
+            name = str(int.from_bytes(raw, "little"))
+            if (cache_dir / name).is_dir():
+                return name
+    digits = [
+        c.name for c in cache_dir.iterdir() if c.is_dir() and c.name.isdigit()
+    ]
+    return max(digits, key=int)
+
+
+def _run_match_phase(
+    tdata_path: Path | None,
+    password: str | None,
+    output_dir: Path,
+    chat_id_text: str,
+    api_id: int,
+    api_hash: str,
+    total: ExtractionStats,
+) -> None:
+    """匹配编排（B-04）：三级匹配后在 manifest 上标注结果。
+
+    只追加标注，不改提取产物与命名（命名生效是 B-07）。提取管道
+    （run_pipeline）零改动；本函数重派生 LocalKey、重读 manifest
+    重建记录后以 write_manifest(matches=...) 重写（工具自身报告）。
+    敏感红线：auth_key/api_hash 不进日志与 manifest。
+    """
+    tdata = Path(tdata_path) if tdata_path else TdataReader.default_tdata_path()
+    reader = TdataReader(tdata)
+    local_key = reader.read_local_key(password or "")
+    auth = reader.read_mtp_authorization(local_key)
+    decryptor = CacheDecryptor(local_key)
+    user_data = tdata / "user_data"
+
+    # 双缓存索引：cache 用文档键，media_cache 用大文件基准键（公式取证见 message_matcher）
+    suites = []
+    for name, key_fn in (
+        ("cache", document_cache_key),
+        ("media_cache", document_bigfile_cache_key),
+    ):
+        cache_dir = user_data / name
+        if not cache_dir.is_dir():
+            continue
+        try:
+            index = read_cache_index(cache_dir, decryptor)
+        except CacheNotFoundError:
+            index = {}
+        suites.append((name, cache_dir, index, key_fn))
+
+    chat_ref = parse_chat_id(chat_id_text)
+
+    async def _fetch_all() -> list[tuple[str, Path, str, list[MatchResult]]]:
+        client = await connect(auth, api_id, api_hash)
+        entity = await resolve_entity(client, chat_ref)
+        limiter = RateLimiter()
+        docs = await fetch_chat_documents(client, entity, limiter)
+
+        async def _fetch_head(doc: DocumentInfo) -> bytes:
+            if doc.raw is None:
+                raise MtprotoError("document raw object missing")
+            buf = bytearray()
+            async for chunk in client.iter_download(doc.raw, chunk_size=65536):
+                buf += chunk
+                if len(buf) >= 1024:
+                    break
+            return bytes(buf[:1024])
+
+        batches = []
+        for name, cache_dir, index, key_fn in suites:
+            if not index:
+                continue
+            version_dir = _version_dir_name(cache_dir)
+
+            def _read_head(place_rel: str, _d=cache_dir, _v=version_dir) -> bytes:
+                stream = decryptor.decrypt_file_iter(_d / _v / place_rel)
+                return next(stream, b"")[:1024]
+
+            batch = await match_with_content(
+                docs, index, auth.dc_id,
+                read_local_head=_read_head, fetch_remote_head=_fetch_head,
+                limiter=limiter, key_fn=key_fn,
+            )
+            batches.append((name, cache_dir, version_dir, batch))
+        return batches
+
+    batches = asyncio.run(_fetch_all())
+
+    # 关联：解密命中条目求 sha256 -> manifest 条目（内容哈希链接）
+    manifest_path = Path(output_dir) / MANIFEST_NAME
+    doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+    by_sha = {
+        (e["sha256"], e["source_cache_dir"]): e["file_name"] for e in doc["entries"]
+    }
+    linked: list[MatchResult] = []
+    for name, cache_dir, version_dir, batch in batches:
+        for m in batch:
+            hasher = hashlib.sha256()
+            for chunk in decryptor.decrypt_file_iter(cache_dir / version_dir / m.place_rel):
+                hasher.update(chunk)
+            file_name = by_sha.get((hasher.hexdigest(), name))
+            linked.append(dc_replace(m, file_name=file_name))
+
+    write_manifest(
+        Path(output_dir),
+        tdata_path=tdata,
+        stats=total,
+        extracted=[ExtractedEntry(**e) for e in doc["entries"]],
+        skipped=[SkippedEntry(**e) for e in doc["skipped_entries"]],
+        failed=[FailedEntry(**e) for e in doc["failed_entries"]],
+        matches=linked,
+    )
+    summary = {"P1": 0, "P2": 0, "P3": 0}
+    for m in linked:
+        if m.level in summary:
+            summary[m.level] += 1
+    print(f"匹配：P1 {summary['P1']} / P2 {summary['P2']} / P3 {summary['P3']}")
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI 主入口：run_pipeline 的薄包装。
 
@@ -336,7 +492,9 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = build_parser().parse_args(argv)
 
-    if args.chat_id is not None:
+    has_api = args.api_id is not None and bool(args.api_hash)
+    if args.chat_id is not None and not has_api:
+        # 缺凭据：沿用既有警告（当前版本忽略）
         print("警告：--chat-id 是 v0.2 预留参数，当前版本忽略", file=sys.stderr)
 
     if args.analyze:
@@ -356,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"错误：--types 含未知类型（{exc}）", file=sys.stderr)
             return EXIT_NOT_FOUND  # 参数错误复用退出码 2 口径
 
+    used_password = args.password
     try:
         try:
             total = run_pipeline(
@@ -367,9 +526,16 @@ def main(argv: list[str] | None = None) -> int:
             entered = getpass.getpass("该 tdata 设有本地密码，请输入: ")
             if not entered:
                 raise PasswordRequiredError("passcode input cancelled")
+            used_password = entered
             total = run_pipeline(
                 args.tdata_path, args.output_dir, entered,
                 progress_cb=print, jobs=args.jobs, allowed_types=allowed,
+            )
+        if args.chat_id is not None and has_api:
+            # B-04：三件套齐备 -> 提取完成后跑匹配（只标注 manifest，不改产物）
+            _run_match_phase(
+                args.tdata_path, used_password, args.output_dir,
+                args.chat_id, args.api_id, args.api_hash, total,
             )
     except (PasswordRequiredError, DecryptionError) as exc:
         print(f"错误：密钥派生失败（{exc}）", file=sys.stderr)
@@ -380,6 +546,9 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"错误：写盘失败，已中止（{exc}）", file=sys.stderr)
         return EXIT_ERROR
+    except APIRateLimitError as exc:
+        print(f"错误：API 限速（{exc}），已安全停止；可稍后重跑续跑", file=sys.stderr)
+        return EXIT_RATE_LIMIT
     except TgScoopError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return EXIT_ERROR
