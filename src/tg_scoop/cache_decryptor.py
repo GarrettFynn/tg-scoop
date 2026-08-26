@@ -47,6 +47,12 @@ class CtrDecryptor:
     签名会诱使调用方用同一 IV 重复解密后续分块（keystream 复用）。
     计数器按 OpenSSL CRYPTO_ctr128_encrypt 惯例大端递增，每 16 字节
     块 +1（对照 refs 实现的 block_index 语义）。
+
+    后端（C-12，依据 0827-0209 审查报告决策 B）：pycryptodome
+    ``AES.MODE_CTR``（``nonce=b""`` + ``initial_value``=iv 大端整型），
+    与 OpenSSL ctr128 语义原生对齐——构造即固化一条流，分块连续性
+    由库内部游标保证；输出与旧"ECB 原语+逐块异或"路径逐字节一致
+    （byte-exact，golden 向量与真机基准对拍验证）。
     """
 
     def __init__(self, key: bytes, iv: bytes) -> None:
@@ -66,8 +72,10 @@ class CtrDecryptor:
 
         from Crypto.Cipher import AES  # 延迟导入：无依赖环境下仍可 import 本模块
 
-        self._cipher = AES.new(key, AES.MODE_ECB)
-        self._counter = int.from_bytes(iv, "big")  # OpenSSL 惯例：大端计数器
+        # 大端初始计数器、大端递增：OpenSSL ctr128 的原生语义
+        self._cipher = AES.new(
+            key, AES.MODE_CTR, nonce=b"", initial_value=int.from_bytes(iv, "big")
+        )
         self._finalized = False  # 处理过非整块尾包后置位，禁止继续解密
 
     def decrypt(self, chunk: bytes) -> bytes:
@@ -87,21 +95,11 @@ class CtrDecryptor:
         if self._finalized:
             raise DecryptionError("CTR stream already finalized by a partial block")
 
-        out = bytearray(len(chunk))
-        full_len = len(chunk) - (len(chunk) % _BLOCK)
-        for off in range(0, full_len, _BLOCK):
-            out[off : off + _BLOCK] = _xor(chunk[off : off + _BLOCK], self._next_block())
-        if full_len < len(chunk):
-            # 尾包不足一块：取 keystream 前缀异或，此后流不可继续
-            out[full_len:] = _xor(chunk[full_len:], self._next_block())
+        out = self._cipher.decrypt(chunk)
+        if len(chunk) % _BLOCK:
+            # 尾包不足一块：此后流不可继续（与旧路径同一语义）
             self._finalized = True
         return bytes(out)
-
-    def _next_block(self) -> bytes:
-        """生成当前计数器对应的 keystream 块并大端递增。"""
-        keystream = self._cipher.encrypt(self._counter.to_bytes(_BLOCK, "big"))
-        self._counter = (self._counter + 1) % (1 << 128)
-        return keystream
 
 
 def derive_storage_key_iv(local_key: bytes, salt: bytes) -> tuple[bytes, bytes]:
