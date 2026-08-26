@@ -25,7 +25,7 @@ from tg_scoop.cache_decryptor import (
     CacheDecryptor,
     iter_cache_files,
 )
-from tg_scoop.cache_index import read_cache_index
+from tg_scoop.cache_index import path_to_place_rel, read_cache_index
 from tg_scoop.exceptions import (
     APIRateLimitError,
     CacheNotFoundError,
@@ -52,6 +52,7 @@ from tg_scoop.media_detector import MediaType
 from tg_scoop.message_matcher import (
     DocumentInfo,
     MatchResult,
+    build_naming,
     document_bigfile_cache_key,
     document_cache_key,
     fetch_chat_documents,
@@ -59,6 +60,7 @@ from tg_scoop.message_matcher import (
 )
 from tg_scoop.mtproto_client import connect, parse_chat_id, resolve_entity
 from tg_scoop.rate_limiter import RateLimiter
+from tg_scoop.state import load_state, save_state
 from tg_scoop.tdata_reader import TdataReader
 
 # 退出码（DEVELOPMENT.md §7.2）
@@ -108,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chat-id",
         default=None,
-        help="【v0.2 预留】只处理指定聊天的媒体；当前版本忽略",
+        help="只处理指定聊天的媒体；配合 --api-id/--api-hash 启用（实验性）",
     )
     parser.add_argument(
         "--jobs",
@@ -151,6 +153,9 @@ def run_pipeline(
     cancel_event: object | None = None,
     jobs: int = 1,
     allowed_types: set[MediaType] | None = None,
+    name_map: dict[str, str] | None = None,
+    sender_map: dict[str, str] | None = None,
+    needs_review: set[str] | None = None,
 ) -> ExtractionStats:
     """共享提取管道：定位 tdata -> 派生 LocalKey -> 双缓存目录提取。
 
@@ -176,6 +181,12 @@ def run_pipeline(
         allowed_types: 可选输出类型过滤集合（C-13）；None=全选
             （现状行为），集合外类型计入 skipped 并记
             ``filtered_by_type:{类型}``。
+        name_map: 可选命名映射（B-07）：place_rel → 期望文件名
+            （API 匹配命中的原始文件名）；None=降级命名（现状）。
+        sender_map: 可选 sender 映射（B-07）：place_rel → 真实
+            发送者名（命中无原始名时的降级命名 sender）。
+        needs_review: 可选 P3 集合（B-07）：place_rel 命中时落
+            ``输出目录/needs-review/`` 子目录。
 
     Returns:
         合并后的提取统计；取消时为部分统计。
@@ -213,7 +224,13 @@ def run_pipeline(
         )
 
     # 共享一个 Extractor 实例：跨目录内容去重因此生效
-    extractor = Extractor(CacheDecryptor(local_key), allowed_types=allowed_types)
+    extractor = Extractor(
+        CacheDecryptor(local_key),
+        allowed_types=allowed_types,
+        name_map=name_map,
+        sender_map=sender_map,
+        needs_review=needs_review,
+    )
     total = ExtractionStats()
     # 预数总文件数（空缓存目录与提取循环同语义：跳过不计）
     total_files = 0
@@ -299,6 +316,7 @@ def _run_pipeline_parallel(
                 extractor.consume_predecrypted(
                     Path(path_str), cache_dir.name,
                     Path(output_dir), total, plain, err,
+                    place_rel=path_to_place_rel(cache_dir, Path(path_str)),
                 )
                 file_cb()
     shutil.rmtree(pool_root, ignore_errors=True)
@@ -371,20 +389,18 @@ def _version_dir_name(cache_dir: Path) -> str:
     return max(digits, key=int)
 
 
-def _run_match_phase(
+def _match_prephase(
     tdata_path: Path | None,
     password: str | None,
     output_dir: Path,
     chat_id_text: str,
     api_id: int,
     api_hash: str,
-    total: ExtractionStats,
-) -> None:
-    """匹配编排（B-04）：三级匹配后在 manifest 上标注结果。
+) -> tuple[Path, list[tuple[str, Path, str, list[MatchResult]]], dict, dict, set]:
+    """匹配前置（B-07）：三件套齐备时，提取前先跑匹配产出命名映射。
 
-    只追加标注，不改提取产物与命名（命名生效是 B-07）。提取管道
-    （run_pipeline）零改动；本函数重派生 LocalKey、重读 manifest
-    重建记录后以 write_manifest(matches=...) 重写（工具自身报告）。
+    返回 (tdata, batches, name_map, sender_map, needs_review)。
+    batches 供提取完成后的 manifest 关联（_match_postphase）。
     敏感红线：auth_key/api_hash 不进日志与 manifest。
     """
     tdata = Path(tdata_path) if tdata_path else TdataReader.default_tdata_path()
@@ -411,11 +427,28 @@ def _run_match_phase(
 
     chat_ref = parse_chat_id(chat_id_text)
 
+    # 断点续跑（B-06）：有状态则从已处理最小 message_id 之下继续
+    state = load_state(output_dir)
+    min_id = None
+    latest_seen: list[int] = []  # progress_cb 即时上报的最近最小 id
+    if state is not None and state.get("chat_id") == chat_ref:
+        min_id = state["last_message_id"]
+        print(f"检测到断点状态，从 message_id < {min_id} 续跑")
+    elif state is not None:
+        print("断点状态对应其他聊天，已从头开始")
+
+    def _on_progress(msg_id: int) -> None:
+        latest_seen.clear()
+        latest_seen.append(msg_id)
+
     async def _fetch_all() -> list[tuple[str, Path, str, list[MatchResult]]]:
         client = await connect(auth, api_id, api_hash)
         entity = await resolve_entity(client, chat_ref)
         limiter = RateLimiter()
-        docs = await fetch_chat_documents(client, entity, limiter)
+        docs = await fetch_chat_documents(
+            client, entity, limiter,
+            min_id_exclusive=min_id, progress_cb=_on_progress,
+        )
 
         async def _fetch_head(doc: DocumentInfo) -> bytes:
             if doc.raw is None:
@@ -445,7 +478,36 @@ def _run_match_phase(
             batches.append((name, cache_dir, version_dir, batch))
         return batches
 
-    batches = asyncio.run(_fetch_all())
+    try:
+        batches = asyncio.run(_fetch_all())
+    except APIRateLimitError:
+        # FloodWait 中断：已处理部分的断点先落盘再上抛（退出码 4 可续跑）
+        if latest_seen:
+            path = save_state(output_dir, chat_ref, latest_seen[0])
+            print(f"断点状态已保存：{path}")
+        raise
+
+    # 匹配完成：合并断点（本轮新处理的最小 id 优先，无新消息则保留旧断点）
+    if latest_seen:
+        path = save_state(output_dir, chat_ref, latest_seen[0])
+        print(f"断点状态已保存：{path}")
+
+    all_matches = [m for _, _, _, batch in batches for m in batch]
+    name_map, sender_map, needs_review = build_naming(all_matches)
+    return tdata, batches, name_map, sender_map, needs_review
+
+
+def _match_postphase(
+    tdata: Path,
+    password: str | None,
+    output_dir: Path,
+    batches: list[tuple[str, Path, str, list[MatchResult]]],
+    total: ExtractionStats,
+) -> None:
+    """匹配后置（提取完成后）：sha256 链接命中条目到输出文件并重写 manifest。"""
+    reader = TdataReader(tdata)
+    local_key = reader.read_local_key(password or "")
+    decryptor = CacheDecryptor(local_key)
 
     # 关联：解密命中条目求 sha256 -> manifest 条目（内容哈希链接）
     manifest_path = Path(output_dir) / MANIFEST_NAME
@@ -494,8 +556,8 @@ def main(argv: list[str] | None = None) -> int:
 
     has_api = args.api_id is not None and bool(args.api_hash)
     if args.chat_id is not None and not has_api:
-        # 缺凭据：沿用既有警告（当前版本忽略）
-        print("警告：--chat-id 是 v0.2 预留参数，当前版本忽略", file=sys.stderr)
+        # 缺凭据：沿用忽略语义（文案按 B-07 微调）
+        print("警告：--chat-id 需配合 --api-id/--api-hash，当前忽略", file=sys.stderr)
 
     if args.analyze:
         # 只读分析模式（C-11）：不解密、不写任何目录
@@ -516,10 +578,33 @@ def main(argv: list[str] | None = None) -> int:
 
     used_password = args.password
     try:
+        prephase = None
+        if args.chat_id is not None and has_api:
+            # B-07：三件套齐备 -> 匹配前置（先产出命名映射，再提取）
+            try:
+                prephase = _match_prephase(
+                    args.tdata_path, used_password, args.output_dir,
+                    args.chat_id, args.api_id, args.api_hash,
+                )
+            except PasswordRequiredError:
+                # 匹配前置需要 LocalKey：交互询问一次（与提取同口径）
+                entered = getpass.getpass("该 tdata 设有本地密码，请输入: ")
+                if not entered:
+                    raise
+                used_password = entered
+                prephase = _match_prephase(
+                    args.tdata_path, used_password, args.output_dir,
+                    args.chat_id, args.api_id, args.api_hash,
+                )
+        name_map = sender_map = needs_review = None
+        if prephase is not None:
+            _tdata, _batches, name_map, sender_map, needs_review = prephase
         try:
             total = run_pipeline(
-                args.tdata_path, args.output_dir, args.password,
+                args.tdata_path, args.output_dir, used_password,
                 progress_cb=print, jobs=args.jobs, allowed_types=allowed,
+                name_map=name_map, sender_map=sender_map,
+                needs_review=needs_review,
             )
         except PasswordRequiredError:
             # 未提供密码但 tdata 设有本地密码：交互询问一次后重试
@@ -530,13 +615,13 @@ def main(argv: list[str] | None = None) -> int:
             total = run_pipeline(
                 args.tdata_path, args.output_dir, entered,
                 progress_cb=print, jobs=args.jobs, allowed_types=allowed,
+                name_map=name_map, sender_map=sender_map,
+                needs_review=needs_review,
             )
-        if args.chat_id is not None and has_api:
-            # B-04：三件套齐备 -> 提取完成后跑匹配（只标注 manifest，不改产物）
-            _run_match_phase(
-                args.tdata_path, used_password, args.output_dir,
-                args.chat_id, args.api_id, args.api_hash, total,
-            )
+        if prephase is not None:
+            # 提取完成：sha256 链接命中条目并重写 manifest（B-04 契约）
+            _tdata, batches, _nm, _sm, _nr = prephase
+            _match_postphase(_tdata, used_password, args.output_dir, batches, total)
     except (PasswordRequiredError, DecryptionError) as exc:
         print(f"错误：密钥派生失败（{exc}）", file=sys.stderr)
         return EXIT_PASSWORD

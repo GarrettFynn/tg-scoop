@@ -870,6 +870,14 @@ class RateLimiter:
 重复运行工具，同一文件算出同一名字，配合 §6.2 的不覆盖规则
 天然实现增量提取。
 
+> 落地注（B-07，v0.2）：三件套齐备时编排改为**匹配前置**——
+> `_match_prephase`（提取前产出 name_map/sender_map/needs_review）
+> → `run_pipeline` 消费映射命名 → `_match_postphase`（sha256 链接
+> 重写 manifest）。P3 落 `输出目录/needs-review/` 子目录（文件名
+> 照旧、查重作用域随目录、manifest file_name 记相对路径）。
+> 幂等依赖命名确定性：同凭据同聊天同缓存 → 同名，重跑全重复
+> 无覆盖。`--chat-id` 同步转正（缺凭据仍忽略并警告）。
+
 ### 6.2 去重与不覆盖（硬性规则）
 
 1. **绝不覆盖已有文件**。目标路径已存在且内容不同 → 按 §6.1 加

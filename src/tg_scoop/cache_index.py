@@ -72,6 +72,15 @@ def place_to_relpath(place: bytes) -> str:
     return digits[0] + digits[1] + "/" + "".join(digits[2:])
 
 
+def path_to_place_rel(cache_dir: Path, path: Path) -> str:
+    """缓存文件路径 → place 相对路径（binlog place_rel 的反算）。
+
+    结构 ``cache_dir/<version>/<place_rel>``（如 cache/1/A5/5B40637E62FA
+    → "A5/5B40637E62FA"）：去掉版本目录层后按 '/' 拼接。
+    """
+    return "/".join(Path(path).relative_to(cache_dir).parts[1:])
+
+
 def _locate_binlog(cache_dir: Path) -> Path:
     """定位 binlog：version 文件（4B LE int32 版本号目录名）优先，
     失败回退扫描纯数字命名子目录，取含 binlog 的最大版本号者。

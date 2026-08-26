@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from tg_scoop.cache_decryptor import CacheDecryptor, iter_cache_files
+from tg_scoop.cache_index import path_to_place_rel
 from tg_scoop.exceptions import DecryptionError, ExtractionError
 from tg_scoop.manifest import ExtractedEntry, FailedEntry, SkippedEntry
 from tg_scoop.media_detector import SNIFF_LEN, MediaDetector, MediaType
@@ -172,6 +173,9 @@ class Extractor:
         decryptor: CacheDecryptor,
         detector: MediaDetector | None = None,
         allowed_types: set[MediaType] | None = None,
+        name_map: dict[str, str] | None = None,
+        sender_map: dict[str, str] | None = None,
+        needs_review: set[str] | None = None,
     ) -> None:
         """初始化提取器。
 
@@ -181,10 +185,19 @@ class Extractor:
             allowed_types: 可选输出类型过滤集合（C-13）；None=不过滤
                 （现状行为），命中集合外类型计入 skipped 并记
                 ``filtered_by_type:{类型}``。
+            name_map: 可选命名映射（B-07）：place_rel → 期望文件名
+                （API 匹配命中的原始文件名）；None=降级命名（现状）。
+            sender_map: 可选 sender 映射（B-07）：place_rel → 真实
+                发送者名，命中无原始名时用于降级命名的 sender 参数。
+            needs_review: 可选 P3 集合（B-07）：place_rel 命中时
+                落 ``out_dir/needs-review/`` 子目录（文件名照旧）。
         """
         self._decryptor = decryptor
         self._detector = detector or MediaDetector()
         self._allowed_types = allowed_types
+        self._name_map = name_map
+        self._sender_map = sender_map
+        self._needs_review = needs_review
         self._seen: set[bytes] = set()  # 本次运行内已落盘的明文 SHA-256
         # manifest 记录（N-1）：由 extract_all 逐分支追加，run_pipeline 统一落盘
         self.extracted_entries: list[ExtractedEntry] = []
@@ -231,7 +244,10 @@ class Extractor:
         for path in iter_cache_files(cache_dir):
             if cancel_event is not None and cancel_event.is_set():
                 break
-            self._process_one(path, source_name, out_dir, stats)
+            self._process_one(
+                path, source_name, out_dir, stats,
+                place_rel=path_to_place_rel(cache_dir, path),
+            )
             if file_cb is not None:
                 file_cb()
 
@@ -243,6 +259,7 @@ class Extractor:
         source_name: str,
         out_dir: Path,
         stats: ExtractionStats,
+        place_rel: str,
     ) -> None:
         """流式处理单个缓存文件（N-5）：首块嗅探 -> 临时文件+流式哈希 -> 查重改名。
 
@@ -294,7 +311,8 @@ class Extractor:
             return
 
         self._finalize(
-            path, source_name, out_dir, stats, tmp_path, digest, size, media_type
+            path, source_name, out_dir, stats, tmp_path, digest, size,
+            media_type, place_rel,
         )
 
     def _finalize(
@@ -307,8 +325,15 @@ class Extractor:
         digest: bytes,
         size: int,
         media_type: MediaType,
+        place_rel: str,
     ) -> None:
-        """查重、命名、改名落盘与计数记录（串行管线与并行消费共用）。"""
+        """查重、命名、改名落盘与计数记录（串行管线与并行消费共用）。
+
+        命名（B-07）：name_map 命中 → 期望文件名（原始文件名）；
+        sender_map 命中 → 降级名用真实 sender；needs_review 命中 →
+        落 ``out_dir/needs-review/``（文件名照旧，manifest 记录相对
+        out_dir 的路径）。三映射全 None = 现状逐字节一致。
+        """
         if self._is_duplicate(digest):
             tmp_path.unlink(missing_ok=True)
             stats.duplicates += 1
@@ -319,11 +344,26 @@ class Extractor:
 
         # §6.1 要求本地时区朴素时间：naive datetime 是有意选择，不加 tz
         mtime = datetime.fromtimestamp(path.stat().st_mtime)  # noqa: DTZ006
-        name = build_fallback_name(mtime, digest, media_type)
+        target_dir = out_dir
+        if self._name_map is not None and place_rel in self._name_map:
+            # name_map 值生产路径已经 sanitize（build_naming），此处防御性
+            # 再过一遍（幂等）：任何来源的映射都不会写出非法文件名
+            name = sanitize_filename(self._name_map[place_rel])
+        else:
+            sender = (
+                self._sender_map.get(place_rel)
+                if self._sender_map is not None
+                else None
+            ) or "unknown"
+            name = build_fallback_name(mtime, digest, media_type, sender=sender)
+        if self._needs_review is not None and place_rel in self._needs_review:
+            target_dir = out_dir / "needs-review"
+            target_dir.mkdir(parents=True, exist_ok=True)
 
         # 幂等关键：确定性命名下，目标已存在且内容相同 -> 计重复跳过；
-        # 内容不同（同名不同物）则由 unique_path 加序号（原 save_media 语义）
-        target = out_dir / name
+        # 内容不同（同名不同物）则由 unique_path 加序号（原 save_media 语义；
+        # needs-review 子目录内查重作用域随目标目录）
+        target = target_dir / name
         if target.exists() and self._file_digest(target) == digest:
             tmp_path.unlink(missing_ok=True)
             self._seen.add(digest)
@@ -333,7 +373,7 @@ class Extractor:
             )
             return
 
-        final_path = unique_path(out_dir, name)
+        final_path = unique_path(target_dir, name)
         os.replace(tmp_path, final_path)  # OSError 上抛
         ts = mtime.timestamp()
         os.utime(final_path, (ts, ts))
@@ -341,7 +381,7 @@ class Extractor:
         stats.succeeded += 1
         self.extracted_entries.append(
             ExtractedEntry(
-                file_name=final_path.name,
+                file_name=final_path.relative_to(out_dir).as_posix(),
                 sha256=digest.hex(),
                 size=size,
                 mtime=mtime.isoformat(timespec="seconds"),
@@ -374,6 +414,7 @@ class Extractor:
         stats: ExtractionStats,
         plain_path: str | None,
         error_reason: str | None,
+        place_rel: str,
     ) -> None:
         """消费并行 worker 的预解密产物（C-02），与 _process_one 同口径。
 
@@ -387,6 +428,7 @@ class Extractor:
             stats: 累计统计（并行路径直接消费进合并统计）。
             plain_path: 池内明文临时文件路径；None 表示解密失败。
             error_reason: 解密失败的异常类型名；None 表示成功。
+            place_rel: 该缓存文件的 place 相对路径（B-07 命名映射键）。
         """
         if error_reason is not None:
             stats.failed += 1
@@ -425,7 +467,7 @@ class Extractor:
                 size += len(chunk)
         self._finalize(
             path, source_name, out_dir, stats,
-            tmp_path, hasher.digest(), size, media_type,
+            tmp_path, hasher.digest(), size, media_type, place_rel,
         )
 
 
